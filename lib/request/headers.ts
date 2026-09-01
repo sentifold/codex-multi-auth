@@ -70,8 +70,15 @@ export function createCodexHeaders(
 	headers.delete("x-api-key"); // Remove any existing API key
 	headers.set("Authorization", `Bearer ${resolvedAccessToken}`);
 	headers.set(OPENAI_HEADERS.ACCOUNT_ID, resolvedAccountId);
-	headers.set(OPENAI_HEADERS.BETA, OPENAI_HEADER_VALUES.BETA_RESPONSES);
-	headers.set(OPENAI_HEADERS.ORIGINATOR, OPENAI_HEADER_VALUES.ORIGINATOR_CODEX);
+	// Preserve a caller-stated client identity: `originator` and the
+	// OpenAI-Beta contract are entitlement-relevant, so they are only
+	// defaulted when the caller did not state them.
+	if (!headers.has(OPENAI_HEADERS.BETA)) {
+		headers.set(OPENAI_HEADERS.BETA, OPENAI_HEADER_VALUES.BETA_RESPONSES);
+	}
+	if (!headers.has(OPENAI_HEADERS.ORIGINATOR)) {
+		headers.set(OPENAI_HEADERS.ORIGINATOR, OPENAI_HEADER_VALUES.ORIGINATOR_CODEX);
+	}
 
     const cacheKey = resolvedOpts?.promptCacheKey;
     if (cacheKey) {

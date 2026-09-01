@@ -566,6 +566,16 @@ describe('Fetch Helpers Module', () => {
 			expect(headers.get('Content-Type')).toBe('application/json');
 		});
 
+		it('preserves a caller-stated originator and OpenAI-Beta identity', () => {
+			const init: RequestInit = {
+				headers: { originator: 'codex_vscode', 'OpenAI-Beta': 'responses=v1' },
+			};
+			const headers = createCodexHeaders(init, accountId, accessToken, { promptCacheKey: 'session-4' });
+
+			expect(headers.get(OPENAI_HEADERS.ORIGINATOR)).toBe('codex_vscode');
+			expect(headers.get(OPENAI_HEADERS.BETA)).toBe('responses=v1');
+		});
+
 		it('should use provided promptCacheKey for both conversation_id and session_id', () => {
 			const key = 'ses_abc123';
 			const headers = createCodexHeaders(undefined, accountId, accessToken, { promptCacheKey: key });
