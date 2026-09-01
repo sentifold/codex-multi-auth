@@ -2260,12 +2260,20 @@ describe("runtime rotation proxy", () => {
 			lastAccountLabel: "Account 2",
 		});
 		expect(proxy.getStatus()).not.toHaveProperty("lastAccountEmail");
+		// Routing preference only: the account was rotated away from, but a
+		// near-exhaustion signal is NOT an observed 429 and must not be written
+		// to the durable rate-limit record. That write used to outlive the
+		// signal by days — nothing clears it before its window elapses, a later
+		// healthy 200 does not, and it is serialized to disk.
 		expect(
 			accountManager.getAccountByIndex(0)?.rateLimitResetTimes["gpt-5-codex"],
-		).toBeTypeOf("number");
+		).toBeUndefined();
 	});
 
-	it("uses the preemptive scheduler fallback when exhaustion has no reset header", async () => {
+	// An exhaustion claim carrying no reset is unfalsifiable, so it steers
+	// routing for one bounded probe horizon rather than benching the account
+	// durably. Rotation still happens; only the disk write is withheld.
+	it("rotates on an unfalsifiable exhaustion claim without benching the account", async () => {
 		const now = Date.now();
 		const accountManager = new AccountManager(undefined, createStorage(now));
 		const { calls, fetchImpl } = createRecordingFetch((_call, attempt) =>
@@ -2282,10 +2290,12 @@ describe("runtime rotation proxy", () => {
 			"acc_1",
 			"acc_2",
 		]);
+		// Previously this wrote a multi-hour rate-limit window to disk on the
+		// strength of a claim with no verifiable reset, so a still-usable
+		// account was reported unavailable long after the signal went stale.
 		expect(
-			(accountManager.getAccountByIndex(0)?.rateLimitResetTimes["gpt-5-codex"] ?? 0) -
-				Date.now(),
-		).toBeGreaterThan(60 * 60 * 1_000);
+			accountManager.getAccountByIndex(0)?.rateLimitResetTimes["gpt-5-codex"],
+		).toBeUndefined();
 	});
 
 	it("keeps quota snapshots attached to account identity across index changes", () => {

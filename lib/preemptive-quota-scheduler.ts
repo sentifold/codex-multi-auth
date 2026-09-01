@@ -61,6 +61,34 @@ function trustedResetWaitMs(
 }
 
 /**
+ * True when a window is *proven* exhausted rather than merely inferred to be
+ * near its ceiling: at or over 100% used, with a reset that is both known and
+ * still ahead. Issue #656 removed the flat deferral cap precisely so such an
+ * account is not released every couple of hours to burn a guaranteed 429, and
+ * that reasoning holds — a proven window keeps its full wait.
+ */
+function windowProvesExhaustion(window: QuotaSchedulerWindow, now: number): boolean {
+	return (
+		typeof window.usedPercent === "number" &&
+		Number.isFinite(window.usedPercent) &&
+		window.usedPercent >= 100 &&
+		typeof window.resetAtMs === "number" &&
+		Number.isFinite(window.resetAtMs) &&
+		window.resetAtMs > now
+	);
+}
+
+/**
+ * True when a deferral was produced by an observed 429 rather than derived
+ * from quota headers. Only an observed rate limit is evidence that the account
+ * is actually refusing work; a near-exhaustion deferral is a routing
+ * preference ("prefer another account"), not a statement that this one is out.
+ */
+export function isObservedRateLimitDeferral(deferral: QuotaDeferralDecision): boolean {
+	return deferral.reason === "rate-limit";
+}
+
+/**
  * Clamp a number to the inclusive integer range [min, max] after flooring.
  *
  * @param value - The input number to be floored and clamped
@@ -332,10 +360,56 @@ export class PreemptiveQuotaScheduler {
 				: 0,
 		);
 		if (nearExhaustedWait > 0) {
-			return { defer: true, waitMs: nearExhaustedWait, reason: "quota-near-exhaustion" };
+			const probeRemainingMs = this.advisoryProbeRemainingMs(snapshot, now);
+			if (probeRemainingMs === null) {
+				return { defer: true, waitMs: nearExhaustedWait, reason: "quota-near-exhaustion" };
+			}
+			if (probeRemainingMs <= 0) {
+				return { defer: false, waitMs: 0 };
+			}
+			return {
+				defer: true,
+				waitMs: Math.min(nearExhaustedWait, probeRemainingMs),
+				reason: "quota-near-exhaustion",
+			};
 		}
 
 		return { defer: false, waitMs: 0 };
+	}
+
+	/**
+	 * How much longer an advisory (non-429) deferral may be trusted.
+	 *
+	 * An advisory deferral is recomputed from the SAME snapshot on every
+	 * selection, so on its own it stays positive until the window's real reset —
+	 * and a snapshot carrying no `resetAtMs` defers forever, because the
+	 * untrusted-reset path falls back to `maxDeferralMs` measured from `now`,
+	 * which slides forward on every poll. A benched account is never selected,
+	 * so no fresh snapshot can arrive to release it: the deferral becomes
+	 * self-sustaining and only a restart clears it.
+	 *
+	 * The horizon is therefore measured from the snapshot that produced the
+	 * signal, making it a fixed deadline rather than a sliding one. Once it
+	 * lapses the account is admitted again, its response refreshes the snapshot,
+	 * and a genuine 429 persists its own server-stated window.
+	 *
+	 * Returns `null` when the snapshot proves exhaustion, meaning no horizon
+	 * applies and the full window stands.
+	 */
+	private advisoryProbeRemainingMs(
+		snapshot: QuotaSchedulerSnapshot,
+		now: number,
+	): number | null {
+		if (
+			windowProvesExhaustion(snapshot.primary, now) ||
+			windowProvesExhaustion(snapshot.secondary, now)
+		) {
+			return null;
+		}
+		const updatedAt = snapshot.updatedAt;
+		if (typeof updatedAt !== "number" || !Number.isFinite(updatedAt)) return null;
+		const elapsed = Math.max(0, now - updatedAt);
+		return Math.max(0, this.maxDeferralMs - elapsed);
 	}
 
 	prune(now = Date.now()): number {
