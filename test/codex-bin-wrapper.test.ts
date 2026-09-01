@@ -1357,7 +1357,10 @@ describe("codex bin wrapper", () => {
 		expect(output).toContain("-- -m gpt-4 please fix");
 	});
 
-	it("repairs local session index and suppresses known Codex rollout-store noise", () => {
+	// Forwarded runs stay on the canonical CODEX_HOME, so official Codex owns the
+	// session index and the wrapper no longer rescans every transcript after a
+	// successful run. Rollout-store noise suppression is unchanged.
+	it("suppresses known Codex rollout-store noise without rewriting the session index", () => {
 		const fixtureRoot = createWrapperFixture();
 		const codexHome = join(fixtureRoot, "codex-home");
 		const sessionId = "019ddf47-2c01-7c73-9f81-ab0cd9c1d5b7";
@@ -1406,13 +1409,9 @@ describe("codex bin wrapper", () => {
 		expect(result.stderr).not.toContain(`${sessionId} not found`);
 		expect(result.stderr).not.toContain("fail to delete session");
 		expect(result.stderr).not.toContain("DELETE returned HTTP 404");
-		expect(readFileSync(join(codexHome, "session_index.jsonl"), "utf8")).toContain(
-			JSON.stringify({
-				id: sessionId,
-				thread_name: marker,
-				updated_at: "2026-04-30T16:44:36.000Z",
-			}),
-		);
+		// The wrapper writes no index of its own; the rollout it just observed is
+		// left for official Codex to index.
+		expect(existsSync(join(codexHome, "session_index.jsonl"))).toBe(false);
 	});
 
 	it("does not repair local session index for failed forwarded runs", () => {
@@ -1449,22 +1448,21 @@ describe("codex bin wrapper", () => {
 		expect(existsSync(join(codexHome, "session_index.jsonl"))).toBe(false);
 	});
 
-	it("skips already indexed rollout files during local session index repair", () => {
+	// An existing index belongs to official Codex. The wrapper must not append to
+	// it, reorder it, or rewrite it after a forwarded run.
+	it("leaves an existing Codex session index byte-identical after a forwarded run", () => {
 		const fixtureRoot = createWrapperFixture();
 		const codexHome = join(fixtureRoot, "codex-home");
 		const indexedSessionId = "019ddf58-f831-7e12-bf4a-fae1ed000011";
 		const mismatchedPayloadId = "019ddf58-f831-7e12-bf4a-fae1ed000012";
 		const missingSessionId = "019ddf58-f831-7e12-bf4a-fae1ed000013";
 		mkdirSync(codexHome, { recursive: true });
-		writeFileSync(
-			join(codexHome, "session_index.jsonl"),
-			`${JSON.stringify({
-				id: indexedSessionId,
-				thread_name: "Already indexed",
-				updated_at: "2026-04-30T17:10:00.000Z",
-			})}\n`,
-			"utf8",
-		);
+		const existingIndex = `${JSON.stringify({
+			id: indexedSessionId,
+			thread_name: "Already indexed",
+			updated_at: "2026-04-30T17:10:00.000Z",
+		})}\n`;
+		writeFileSync(join(codexHome, "session_index.jsonl"), existingIndex, "utf8");
 		const fakeBin = createCustomFakeCodexBin(fixtureRoot, [
 			"const { mkdirSync, writeFileSync } = require('node:fs');",
 			"const { join } = require('node:path');",
@@ -1513,15 +1511,22 @@ describe("codex bin wrapper", () => {
 		expect(result.status).toBe(0);
 		expect(result.stdout).toContain("FORWARDED_INDEX_FAST_PATH");
 		const index = readFileSync(join(codexHome, "session_index.jsonl"), "utf8");
+		expect(index).toBe(existingIndex);
 		expect(index).toContain(indexedSessionId);
-		expect(index).toContain(missingSessionId);
-		expect(index).toContain("MISSING_SESSION");
+		// The three rollouts the run produced are official Codex's to index.
+		expect(index).not.toContain(missingSessionId);
+		expect(index).not.toContain("MISSING_SESSION");
 		expect(index).not.toContain(mismatchedPayloadId);
 		expect(index).not.toContain("ALREADY_INDEXED_SHOULD_SKIP");
 		expect(index).not.toContain("SHOULD_NOT_BE_REPAIRED");
 	});
 
-	it("serializes concurrent local session index repairs", async () => {
+	// Previously this proved the post-run index repair serialized on the shadow
+	// sync lock. That repair is gone; what still has to hold is that two
+	// overlapping forwarded runs on one CODEX_HOME both complete and neither
+	// fabricates an index. Lock serialization itself stays covered by the
+	// orphaned/stale shadow-sync-lock tests below.
+	it("forwards concurrent runs on one CODEX_HOME without writing a session index", async () => {
 		const fixtureRoot = createWrapperFixture();
 		const codexHome = join(fixtureRoot, "codex-home");
 		const readyDir = join(fixtureRoot, "ready");
@@ -1576,11 +1581,13 @@ describe("codex bin wrapper", () => {
 
 		expect(first.status).toBe(0);
 		expect(second.status).toBe(0);
-		const index = readFileSync(join(codexHome, "session_index.jsonl"), "utf8");
-		expect(index).toContain(firstSessionId);
-		expect(index).toContain("FIRST_CONCURRENT_SESSION");
-		expect(index).toContain(secondSessionId);
-		expect(index).toContain("SECOND_CONCURRENT_SESSION");
+		expect(combinedOutput(first)).toContain(
+			`FORWARDED_CONCURRENT:${firstSessionId}`,
+		);
+		expect(combinedOutput(second)).toContain(
+			`FORWARDED_CONCURRENT:${secondSessionId}`,
+		);
+		expect(existsSync(join(codexHome, "session_index.jsonl"))).toBe(false);
 	});
 
 	it("forwards non-auth commands to native codex executables", () => {
@@ -1634,7 +1641,13 @@ describe("codex bin wrapper", () => {
 		);
 	});
 
-	it("starts the opt-in runtime rotation proxy with a shadow CODEX_HOME provider", () => {
+	// #647 moved `resume`/`fork` and #659 moved `app-server` onto the canonical
+	// CODEX_HOME because a freshly built shadow omits `state_*.sqlite`, which
+	// makes official Codex rebuild its entire session index before it will issue
+	// a request. `exec`/`review` had the same defect and now take the same route:
+	// the rotation provider is isolated through `-c` overrides on the command
+	// line instead of a rewritten `config.toml` inside a throwaway home.
+	it("runs the opt-in runtime rotation proxy on the canonical CODEX_HOME", () => {
 		const fixtureRoot = createWrapperFixture();
 		createRuntimeRotationProxyFixtureModule(fixtureRoot);
 		const fakeBin = createCustomFakeCodexBin(fixtureRoot, [
@@ -1642,160 +1655,32 @@ describe("codex bin wrapper", () => {
 			'const fs = require("node:fs");',
 			'const path = require("node:path");',
 			'console.log(`FORWARDED:${process.argv.slice(2).join(" ")}`);',
-			'console.log(`CODEX_HOME:${process.env.CODEX_HOME ?? ""}`);',
 			'console.log(`CODEX_HOME_IS_ORIGINAL:${process.env.CODEX_HOME === process.env.ORIGINAL_CODEX_HOME}`);',
 			'console.log(`CODEX_MULTI_AUTH_DIR:${process.env.CODEX_MULTI_AUTH_DIR ?? ""}`);',
 			'console.log(`OPENAI_API_KEY:${process.env.OPENAI_API_KEY ?? ""}`);',
+			// The point of the change: the canonical thread index is in place, so
+			// Codex has nothing to rebuild before its first request.
+			'console.log(`THREAD_INDEX_VISIBLE:${fs.existsSync(path.join(process.env.CODEX_HOME ?? "", "state_5.sqlite"))}`);',
 			'console.log(`SESSION_EXISTS:${fs.existsSync(path.join(process.env.CODEX_HOME ?? "", "sessions", "resume.jsonl"))}`);',
-			'console.log(`PLUGIN_EXISTS:${fs.existsSync(path.join(process.env.CODEX_HOME ?? "", "plugins", "plugin.txt"))}`);',
-			'console.log(`SKILL_EXISTS:${fs.existsSync(path.join(process.env.CODEX_HOME ?? "", "skills", "skill.txt"))}`);',
-			'console.log(`MEMORY_EXISTS:${fs.existsSync(path.join(process.env.CODEX_HOME ?? "", "memories", "user.md"))}`);',
-			'console.log(`INSTRUCTION_EXISTS:${fs.existsSync(path.join(process.env.CODEX_HOME ?? "", "instructions", "profile.md"))}`);',
-			'console.log(`SANDBOX_BIN_EXISTS:${fs.existsSync(path.join(process.env.CODEX_HOME ?? "", ".sandbox-bin", "codex.exe"))}`);',
-			'console.log(`MULTI_AUTH_MIRRORED:${fs.existsSync(path.join(process.env.CODEX_HOME ?? "", "multi-auth"))}`);',
-			'const authTmpPath = path.join(process.env.CODEX_HOME ?? "", "auth.json.1772056142508.3nwgwa.tmp");',
-			'const accountsTmpPath = path.join(process.env.CODEX_HOME ?? "", "accounts.json.1772056142508.3nwgwa.tmp");',
-			'const globalStateTmpPath = path.join(process.env.CODEX_HOME ?? "", ".codex-global-state.json.tmp-1777087904981-b612ed77-42c6-452a-a3ee-181a3806b475");',
-			'const originalAuthTmpPath = path.join(process.env.ORIGINAL_CODEX_HOME ?? "", "auth.json.1772056142508.3nwgwa.tmp");',
-			'const originalAccountsTmpPath = path.join(process.env.ORIGINAL_CODEX_HOME ?? "", "accounts.json.1772056142508.3nwgwa.tmp");',
-			'const originalGlobalStateTmpPath = path.join(process.env.ORIGINAL_CODEX_HOME ?? "", ".codex-global-state.json.tmp-1777087904981-b612ed77-42c6-452a-a3ee-181a3806b475");',
-			'console.log(`AUTH_TMP_MIRRORED:${fs.existsSync(authTmpPath)}`);',
-			'console.log(`ACCOUNTS_TMP_MIRRORED:${fs.existsSync(accountsTmpPath)}`);',
-			'console.log(`GLOBAL_STATE_TMP_MIRRORED:${fs.existsSync(globalStateTmpPath)}`);',
-			'fs.writeFileSync(authTmpPath, "shadow-auth-tmp\\n", "utf8");',
-			'fs.writeFileSync(accountsTmpPath, "shadow-accounts-tmp\\n", "utf8");',
-			'fs.writeFileSync(globalStateTmpPath, "shadow-global-state-tmp\\n", "utf8");',
-			'console.log(`AUTH_TMP_ISOLATED:${!fs.readFileSync(originalAuthTmpPath, "utf8").includes("shadow-auth-tmp")}`);',
-			'console.log(`ACCOUNTS_TMP_ISOLATED:${!fs.readFileSync(originalAccountsTmpPath, "utf8").includes("shadow-accounts-tmp")}`);',
-			'console.log(`GLOBAL_STATE_TMP_ISOLATED:${!fs.readFileSync(originalGlobalStateTmpPath, "utf8").includes("shadow-global-state-tmp")}`);',
-			'const cachePath = path.join(process.env.CODEX_HOME ?? "", "plugin_cache.sqlite");',
-			'const cacheWalPath = path.join(process.env.CODEX_HOME ?? "", "plugin_cache.sqlite-wal");',
-			'const cacheShmPath = path.join(process.env.CODEX_HOME ?? "", "plugin_cache.sqlite-shm");',
-			'console.log(`CACHE_SQLITE_MIRRORED:${fs.existsSync(cachePath)}`);',
-			'console.log(`CACHE_WAL_MIRRORED:${fs.existsSync(cacheWalPath)}`);',
-			'console.log(`CACHE_SHM_MIRRORED:${fs.existsSync(cacheShmPath)}`);',
-			'const logPath = path.join(process.env.CODEX_HOME ?? "", "logs_2.sqlite");',
-			'const logWalPath = path.join(process.env.CODEX_HOME ?? "", "logs_2.sqlite-wal");',
-			'const logShmPath = path.join(process.env.CODEX_HOME ?? "", "logs_2.sqlite-shm");',
-			'const originalLogPath = path.join(process.env.ORIGINAL_CODEX_HOME ?? "", "logs_2.sqlite");',
-			'console.log(`LOG_SQLITE_MIRRORED:${fs.existsSync(logPath)}`);',
-			'console.log(`LOG_WAL_MIRRORED:${fs.existsSync(logWalPath)}`);',
-			'console.log(`LOG_SHM_MIRRORED:${fs.existsSync(logShmPath)}`);',
-			'fs.writeFileSync(logPath, "shadow-log\\n", "utf8");',
-			'fs.writeFileSync(logWalPath, "shadow-log-wal\\n", "utf8");',
-			'fs.writeFileSync(logShmPath, "shadow-log-shm\\n", "utf8");',
-			'console.log(`LOG_SQLITE_ISOLATED:${!fs.readFileSync(originalLogPath, "utf8").includes("shadow-log")}`);',
-			'const upperLogPath = path.join(process.env.CODEX_HOME ?? "", "LOGS_3.sqlite");',
-			'console.log(`UPPER_LOG_MIRRORED:${fs.existsSync(upperLogPath)}`);',
-			'fs.appendFileSync(upperLogPath, "shadow-upper-log\\n", "utf8");',
-			'fs.appendFileSync(cachePath, "shadow-cache\\n", "utf8");',
-			'fs.appendFileSync(cacheWalPath, "shadow-wal\\n", "utf8");',
-			'const upperStatePath = path.join(process.env.CODEX_HOME ?? "", "STATE_6.sqlite");',
-			'console.log(`UPPER_STATE_MIRRORED:${fs.existsSync(upperStatePath)}`);',
-			'fs.appendFileSync(upperStatePath, "shadow-upper\\n", "utf8");',
-			'const statePath = path.join(process.env.CODEX_HOME ?? "", "state_5.sqlite");',
-			'const stateWalPath = path.join(process.env.CODEX_HOME ?? "", "state_5.sqlite-wal");',
-			'const stateShmPath = path.join(process.env.CODEX_HOME ?? "", "state_5.sqlite-shm");',
-			'const originalStatePath = path.join(process.env.ORIGINAL_CODEX_HOME ?? "", "state_5.sqlite");',
-			'console.log(`ROOT_STATE_MIRRORED:${fs.existsSync(statePath)}`);',
-			'console.log(`ROOT_STATE_WAL_MIRRORED:${fs.existsSync(stateWalPath)}`);',
-			'console.log(`ROOT_STATE_SHM_MIRRORED:${fs.existsSync(stateShmPath)}`);',
-			'fs.writeFileSync(statePath, "shadow-only\\n", "utf8");',
-			'console.log(`ROOT_STATE_ISOLATED:${!fs.readFileSync(originalStatePath, "utf8").includes("shadow-only")}`);',
-			'fs.writeFileSync(path.join(process.env.CODEX_HOME ?? "", "new-root-state.json"), "new\\n", "utf8");',
-			'fs.writeFileSync(path.join(process.env.CODEX_HOME ?? "", "sessions", "runtime-session.jsonl"), "runtime\\n", "utf8");',
-			'fs.writeFileSync(path.join(process.env.CODEX_HOME ?? "", "auth.json"), \'{"token":"proxy-scoped"}\\n\', "utf8");',
-			'fs.writeFileSync(path.join(process.env.CODEX_HOME ?? "", "accounts.json"), \'{"accounts":["proxy-scoped"]}\\n\', "utf8");',
-			'fs.writeFileSync(path.join(process.env.CODEX_HOME ?? "", ".codex-global-state.json"), \'{"last":"runtime"}\\n\', "utf8");',
-			'const configPath = path.join(process.env.CODEX_HOME ?? "", "config.toml");',
 			'console.log("CONFIG_START");',
-			'console.log(fs.readFileSync(configPath, "utf8").trim());',
+			'console.log(fs.readFileSync(path.join(process.env.CODEX_HOME ?? "", "config.toml"), "utf8").trim());',
 			'console.log("CONFIG_END");',
 			"process.exit(0);",
 		]);
 		const originalHome = join(fixtureRoot, "codex-home");
 		const markerPath = join(fixtureRoot, "proxy-marker.txt");
-		mkdirSync(originalHome, { recursive: true });
+		const originalConfig = ['model = "gpt-5-codex"', 'model_provider = "openai"', ""].join(
+			"\n",
+		);
 		mkdirSync(join(originalHome, "sessions"), { recursive: true });
-		mkdirSync(join(originalHome, "plugins"), { recursive: true });
-		mkdirSync(join(originalHome, "skills"), { recursive: true });
-		mkdirSync(join(originalHome, "memories"), { recursive: true });
-		mkdirSync(join(originalHome, "instructions"), { recursive: true });
-		mkdirSync(join(originalHome, ".sandbox-bin"), { recursive: true });
-		mkdirSync(join(originalHome, "multi-auth", "runtime-shadow-homes", "stale"), {
-			recursive: true,
-		});
 		writeFileSync(join(originalHome, "sessions", "resume.jsonl"), "resume\n", "utf8");
-		writeFileSync(join(originalHome, "plugins", "plugin.txt"), "plugin\n", "utf8");
-		writeFileSync(join(originalHome, "skills", "skill.txt"), "skill\n", "utf8");
-		writeFileSync(join(originalHome, "memories", "user.md"), "memory\n", "utf8");
-		writeFileSync(join(originalHome, ".sandbox-bin", "codex.exe"), "sandbox\n", "utf8");
 		writeFileSync(
-			join(originalHome, "multi-auth", "runtime-shadow-homes", "stale", "payload.txt"),
-			"stale shadow\n",
+			join(originalHome, "state_5.sqlite"),
+			"canonical-thread-index\n",
 			"utf8",
 		);
 		writeFileSync(join(originalHome, "auth.json"), '{"token":"original"}\n', "utf8");
-		writeFileSync(
-			join(originalHome, "auth.json.1772056142508.3nwgwa.tmp"),
-			"original auth tmp\n",
-			"utf8",
-		);
-		writeFileSync(
-			join(originalHome, "accounts.json.1772056142508.3nwgwa.tmp"),
-			"original accounts tmp\n",
-			"utf8",
-		);
-		writeFileSync(
-			join(
-				originalHome,
-				".codex-global-state.json.tmp-1777087904981-b612ed77-42c6-452a-a3ee-181a3806b475",
-			),
-			"original global state tmp\n",
-			"utf8",
-		);
-		writeFileSync(
-			join(originalHome, "accounts.json"),
-			'{"accounts":["original"]}\n',
-			"utf8",
-		);
-		writeFileSync(
-			join(originalHome, ".codex-global-state.json"),
-			'{"last":"original"}\n',
-			"utf8",
-		);
-		writeFileSync(
-			join(originalHome, "instructions", "profile.md"),
-			"instruction\n",
-			"utf8",
-		);
-		writeFileSync(join(originalHome, "state_5.sqlite"), "not a sqlite database\n", "utf8");
-		writeFileSync(join(originalHome, "state_5.sqlite-wal"), "original wal\n", "utf8");
-		writeFileSync(join(originalHome, "state_5.sqlite-shm"), "original shm\n", "utf8");
-		writeFileSync(join(originalHome, "STATE_6.sqlite"), "upper state\n", "utf8");
-		writeFileSync(join(originalHome, "logs_2.sqlite"), "original log\n", "utf8");
-		writeFileSync(join(originalHome, "logs_2.sqlite-wal"), "original log wal\n", "utf8");
-		writeFileSync(join(originalHome, "logs_2.sqlite-shm"), "original log shm\n", "utf8");
-		writeFileSync(join(originalHome, "LOGS_3.sqlite"), "upper log\n", "utf8");
-		writeFileSync(join(originalHome, "plugin_cache.sqlite"), "cache\n", "utf8");
-		writeFileSync(join(originalHome, "plugin_cache.sqlite-wal"), "cache wal\n", "utf8");
-		writeFileSync(join(originalHome, "plugin_cache.sqlite-shm"), "cache shm\n", "utf8");
-		writeFileSync(
-			join(originalHome, "config.toml"),
-			[
-				'model = "gpt-5-codex"',
-				'model_provider = "openai"',
-				"",
-				"[model_providers.existing]",
-				'name = "Existing"',
-				'base_url = "https://example.invalid"',
-				"",
-				`[ model_providers.${RUNTIME_ROTATION_PROXY_PROVIDER_ID} ]`,
-				'name = "Stale Runtime Proxy"',
-				'base_url = "http://127.0.0.1:1"',
-			].join("\n"),
-			"utf8",
-		);
+		writeFileSync(join(originalHome, "config.toml"), originalConfig, "utf8");
 
 		const result = runWrapper(fixtureRoot, ["exec", "status"], {
 			CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
@@ -1804,170 +1689,129 @@ describe("codex bin wrapper", () => {
 			CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
 			CODEX_MULTI_AUTH_TEST_PROXY_BASE_URL: "http://127.0.0.1:4567",
 			CODEX_MULTI_AUTH_TEST_PROXY_MARKER: markerPath,
-			CODEX_MULTI_AUTH_TEST_FORCE_SHADOW_DIR_COPY: "1",
 			OPENAI_API_KEY: undefined,
 		});
 
 		const output = combinedOutput(result);
-		expect(result.status).toBe(0);
-		expect(output).toContain(
-			`FORWARDED:exec status -c cli_auth_credentials_store="file" -c model_provider="${RUNTIME_ROTATION_PROXY_PROVIDER_ID}"`,
-		);
-		expect(output).toContain("CODEX_HOME_IS_ORIGINAL:false");
+		if (result.status !== 0) {
+			throw new Error(output);
+		}
+		expect(output).toContain("CODEX_HOME_IS_ORIGINAL:true");
+		expect(output).toContain("THREAD_INDEX_VISIBLE:true");
+		expect(output).toContain("SESSION_EXISTS:true");
 		expect(output).toContain(
 			`CODEX_MULTI_AUTH_DIR:${join(originalHome, "multi-auth")}`,
 		);
-		expect(output).toContain("SESSION_EXISTS:true");
-		expect(output).toContain("PLUGIN_EXISTS:true");
-		expect(output).toContain("SKILL_EXISTS:true");
-		expect(output).toContain("MEMORY_EXISTS:true");
-		expect(output).toContain("INSTRUCTION_EXISTS:true");
-		expect(output).toContain("SANDBOX_BIN_EXISTS:false");
-		expect(output).toContain("MULTI_AUTH_MIRRORED:false");
-		expect(output).toContain("AUTH_TMP_MIRRORED:false");
-		expect(output).toContain("ACCOUNTS_TMP_MIRRORED:false");
-		expect(output).toContain("GLOBAL_STATE_TMP_MIRRORED:false");
-		expect(output).toContain("AUTH_TMP_ISOLATED:true");
-		expect(output).toContain("ACCOUNTS_TMP_ISOLATED:true");
-		expect(output).toContain("GLOBAL_STATE_TMP_ISOLATED:true");
-		expect(output).toContain("CACHE_SQLITE_MIRRORED:true");
-		expect(output).toContain("CACHE_WAL_MIRRORED:true");
-		expect(output).toContain("CACHE_SHM_MIRRORED:true");
-		expect(output).toContain("LOG_SQLITE_MIRRORED:false");
-		expect(output).toContain("LOG_WAL_MIRRORED:false");
-		expect(output).toContain("LOG_SHM_MIRRORED:false");
-		expect(output).toContain("LOG_SQLITE_ISOLATED:true");
-		expect(output).toContain(
-			`UPPER_LOG_MIRRORED:${process.platform === "win32" || process.platform === "darwin" ? "false" : "true"}`,
-		);
-		expect(output).toContain(
-			`UPPER_STATE_MIRRORED:${process.platform === "win32" || process.platform === "darwin" ? "false" : "true"}`,
-		);
-		expect(output).toContain("ROOT_STATE_MIRRORED:false");
-		expect(output).toContain("ROOT_STATE_WAL_MIRRORED:false");
-		expect(output).toContain("ROOT_STATE_SHM_MIRRORED:false");
-		expect(output).toContain("ROOT_STATE_ISOLATED:true");
 		const apiKeyMatch = output.match(/^OPENAI_API_KEY:([0-9a-f]{64})$/m);
 		expect(apiKeyMatch?.[1]).toBeTruthy();
+		// Provider isolation now rides on the command line, per run.
 		expect(output).toContain(
-			`model_provider = "${RUNTIME_ROTATION_PROXY_PROVIDER_ID}"`,
+			`-c model_providers.${RUNTIME_ROTATION_PROXY_PROVIDER_ID}.base_url="http://127.0.0.1:4567"`,
 		);
 		expect(output).toContain(
+			`-c model_providers.${RUNTIME_ROTATION_PROXY_PROVIDER_ID}.env_key="OPENAI_API_KEY"`,
+		);
+		expect(output).toContain(
+			`-c model_providers.${RUNTIME_ROTATION_PROXY_PROVIDER_ID}.requires_openai_auth=false`,
+		);
+		expect(output).toContain(
+			`-c model_providers.${RUNTIME_ROTATION_PROXY_PROVIDER_ID}.wire_api="responses"`,
+		);
+		expect(output).toContain(
+			`-c model_provider="${RUNTIME_ROTATION_PROXY_PROVIDER_ID}"`,
+		);
+		// The user's own config.toml is never rewritten — not in the child's view
+		// of CODEX_HOME, and not on disk.
+		expect(output).toContain('model_provider = "openai"');
+		expect(output).not.toContain(
 			`[model_providers.${RUNTIME_ROTATION_PROXY_PROVIDER_ID}]`,
 		);
-		expect(output).toContain('name = "codex-multi-auth"');
-		expect(output).toContain('base_url = "http://127.0.0.1:4567"');
-		expect(output).toContain("requires_openai_auth = false");
-		expect(output).toContain('name = "codex-multi-auth"');
-		expect(output).toContain(
-			`experimental_bearer_token = "${apiKeyMatch?.[1]}"`,
+		expect(readFileSync(join(originalHome, "config.toml"), "utf8")).toBe(
+			originalConfig,
 		);
-		expect(output).toContain('wire_api = "responses"');
-		expect(output).not.toContain("env_key");
-		expect(output).not.toContain('base_url = "http://127.0.0.1:1"');
-		expect((output.match(/\[model_providers\.codex-multi-auth-runtime-proxy\]/g) ?? []).length).toBe(1);
-		const shadowHomeMatch = output.match(/^CODEX_HOME:(.+)$/m);
-		expect(shadowHomeMatch?.[1]).toBeTruthy();
-		if (shadowHomeMatch?.[1]) {
-			const expectedRoot = resolve(originalHome, "multi-auth", "runtime-shadow-homes");
-			const actual = resolve(shadowHomeMatch[1]);
-			const shadowRelativePath = relative(expectedRoot, actual);
-			expect(shadowRelativePath).not.toMatch(/^\.\.(?:[\\/]|$)/);
-			expect(isAbsolute(shadowRelativePath)).toBe(false);
-			expect(existsSync(shadowHomeMatch[1])).toBe(false);
-		}
-		expect(readFileSync(markerPath, "utf8")).toBe(
-			"start:http://127.0.0.1:4567\nclose\n",
-		);
-		expect(readFileSync(join(originalHome, "config.toml"), "utf8")).toContain(
-			'model_provider = "openai"',
-		);
-		expect(
-			readFileSync(join(originalHome, "sessions", "runtime-session.jsonl"), "utf8"),
-		).toBe("runtime\n");
-		expect(readFileSync(join(originalHome, "state_5.sqlite"), "utf8")).toBe(
-			"not a sqlite database\n",
-		);
-		expect(readFileSync(join(originalHome, "state_5.sqlite-wal"), "utf8")).toBe(
-			"original wal\n",
-		);
-		expect(readFileSync(join(originalHome, "state_5.sqlite-shm"), "utf8")).toBe(
-			"original shm\n",
-		);
-		expect(
-			readFileSync(
-				join(originalHome, "auth.json.1772056142508.3nwgwa.tmp"),
-				"utf8",
-			),
-		).toBe("original auth tmp\n");
-		expect(
-			readFileSync(
-				join(originalHome, "accounts.json.1772056142508.3nwgwa.tmp"),
-				"utf8",
-			),
-		).toBe("original accounts tmp\n");
-		expect(
-			readFileSync(
-				join(
-					originalHome,
-					".codex-global-state.json.tmp-1777087904981-b612ed77-42c6-452a-a3ee-181a3806b475",
-				),
-				"utf8",
-			),
-		).toBe("original global state tmp\n");
-		expect(readFileSync(join(originalHome, "logs_2.sqlite"), "utf8")).toBe(
-			"original log\n",
-		);
-		expect(readFileSync(join(originalHome, "logs_2.sqlite-wal"), "utf8")).toBe(
-			"original log wal\n",
-		);
-		expect(readFileSync(join(originalHome, "logs_2.sqlite-shm"), "utf8")).toBe(
-			"original log shm\n",
-		);
-		if (process.platform === "win32" || process.platform === "darwin") {
-			expect(readFileSync(join(originalHome, "LOGS_3.sqlite"), "utf8")).toBe(
-				"upper log\n",
-			);
-		} else {
-			expect(readFileSync(join(originalHome, "LOGS_3.sqlite"), "utf8")).toContain(
-				"shadow-upper-log",
-			);
-		}
-		if (process.platform === "win32" || process.platform === "darwin") {
-			expect(readFileSync(join(originalHome, "STATE_6.sqlite"), "utf8")).toBe(
-				"upper state\n",
-			);
-		} else {
-			expect(readFileSync(join(originalHome, "STATE_6.sqlite"), "utf8")).toContain(
-				"shadow-upper",
-			);
-		}
-		expect(readFileSync(join(originalHome, "plugin_cache.sqlite"), "utf8")).toContain(
-			"shadow-cache",
-		);
-		expect(readFileSync(join(originalHome, "plugin_cache.sqlite-wal"), "utf8")).toContain(
-			"shadow-wal",
-		);
-		expect(readFileSync(join(originalHome, "new-root-state.json"), "utf8")).toBe(
-			"new\n",
-		);
+		// Nothing is copied out and nothing syncs back: the canonical home is used
+		// in place, so auth state is exactly where the child left it.
 		expect(readFileSync(join(originalHome, "auth.json"), "utf8").trim()).toBe(
 			'{"token":"original"}',
 		);
-		expect(readFileSync(join(originalHome, "accounts.json"), "utf8").trim()).toBe(
-			'{"accounts":["original"]}',
-		);
-		expect(
-			readFileSync(join(originalHome, ".codex-global-state.json"), "utf8").trim(),
-		).toBe('{"last":"runtime"}');
-		expect(output).toContain(
-			"codex-multi-auth: skipped optional shadow-home directory .sandbox-bin because linking failed",
+		expect(readFileSync(markerPath, "utf8")).toBe(
+			"start:http://127.0.0.1:4567\nclose\n",
 		);
 	});
 
-	it("warns when sqlite sidecar placeholder materialization fails", () => {
+	// `codex app` is now the only branch that still builds a runtime shadow
+	// CODEX_HOME (`exec`/`review`/`resume`/`fork`/`app-server` all run canonical),
+	// so the shadow mirror keeps its end-to-end coverage through this command.
+	it("keeps `codex app` on an isolated runtime shadow CODEX_HOME", async () => {
 		const fixtureRoot = createWrapperFixture();
 		createRuntimeRotationProxyFixtureModule(fixtureRoot);
+		const fakeBin = createCustomFakeCodexBin(fixtureRoot, [
+			"#!/usr/bin/env node",
+			'const fs = require("node:fs");',
+			'const path = require("node:path");',
+			'console.log(`CODEX_HOME_IS_ORIGINAL:${process.env.CODEX_HOME === process.env.ORIGINAL_CODEX_HOME}`);',
+			'console.log(`SESSION_EXISTS:${fs.existsSync(path.join(process.env.CODEX_HOME ?? "", "sessions", "resume.jsonl"))}`);',
+			'console.log(`PLUGIN_EXISTS:${fs.existsSync(path.join(process.env.CODEX_HOME ?? "", "plugins", "plugin.txt"))}`);',
+			'console.log(`MULTI_AUTH_MIRRORED:${fs.existsSync(path.join(process.env.CODEX_HOME ?? "", "multi-auth"))}`);',
+			// Root state files are deliberately omitted from the shadow so official
+			// Codex cannot write official auth/thread state into a throwaway home.
+			'console.log(`ROOT_STATE_MIRRORED:${fs.existsSync(path.join(process.env.CODEX_HOME ?? "", "state_5.sqlite"))}`);',
+			'console.log("CONFIG_START");',
+			'console.log(fs.readFileSync(path.join(process.env.CODEX_HOME ?? "", "config.toml"), "utf8").trim());',
+			'console.log("CONFIG_END");',
+			"process.exit(0);",
+		]);
+		const originalHome = join(fixtureRoot, "codex-home");
+		const markerPath = join(fixtureRoot, "proxy-marker.txt");
+		const originalConfig = 'model_provider = "openai"\n';
+		mkdirSync(join(originalHome, "sessions"), { recursive: true });
+		mkdirSync(join(originalHome, "plugins"), { recursive: true });
+		writeFileSync(join(originalHome, "sessions", "resume.jsonl"), "resume\n", "utf8");
+		writeFileSync(join(originalHome, "plugins", "plugin.txt"), "plugin\n", "utf8");
+		writeFileSync(join(originalHome, "state_5.sqlite"), "official state\n", "utf8");
+		writeFileSync(join(originalHome, "config.toml"), originalConfig, "utf8");
+
+		const result = runWrapper(fixtureRoot, ["app", "."], {
+			CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
+			CODEX_HOME: originalHome,
+			ORIGINAL_CODEX_HOME: originalHome,
+			CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
+			CODEX_MULTI_AUTH_APP_ROTATION_IDLE_MS: "1000",
+			CODEX_MULTI_AUTH_TEST_PROXY_BASE_URL: "http://127.0.0.1:4567",
+			CODEX_MULTI_AUTH_TEST_PROXY_MARKER: markerPath,
+			OPENAI_API_KEY: undefined,
+		});
+
+		const output = combinedOutput(result);
+		if (result.status !== 0) {
+			throw new Error(output);
+		}
+		expect(output).toContain("CODEX_HOME_IS_ORIGINAL:false");
+		expect(output).toContain("SESSION_EXISTS:true");
+		expect(output).toContain("PLUGIN_EXISTS:true");
+		expect(output).toContain("MULTI_AUTH_MIRRORED:false");
+		expect(output).toContain("ROOT_STATE_MIRRORED:false");
+		expect(output).toContain(
+			`[model_providers.${RUNTIME_ROTATION_PROXY_PROVIDER_ID}]`,
+		);
+		expect(output).toContain('base_url = "http://127.0.0.1:4567"');
+		// The canonical config.toml is never rewritten on disk.
+		expect(readFileSync(join(originalHome, "config.toml"), "utf8")).toBe(
+			originalConfig,
+		);
+		expect(readFileSync(join(originalHome, "state_5.sqlite"), "utf8")).toBe(
+			"official state\n",
+		);
+
+		await sleep(2200);
+		expect(readFileSync(markerPath, "utf8")).toContain("close\n");
+	});
+
+	// Driven through the compatibility shadow home (`--model` + an `xhigh`
+	// config), which shares `createShadowHomeMirror` with the runtime rotation
+	// shadow. `exec` itself no longer builds a rotation shadow.
+	it("warns when sqlite sidecar placeholder materialization fails", () => {
+		const fixtureRoot = createWrapperFixture();
 		const fakeBin = createCustomFakeCodexBin(fixtureRoot, [
 			"#!/usr/bin/env node",
 			'const fs = require("node:fs");',
@@ -1981,18 +1825,20 @@ describe("codex bin wrapper", () => {
 			"process.exit(0);",
 		]);
 		const originalHome = join(fixtureRoot, "codex-home");
-		const markerPath = join(fixtureRoot, "proxy-marker.txt");
 		mkdirSync(originalHome, { recursive: true });
+		writeFileSync(
+			join(originalHome, "config.toml"),
+			'model_reasoning_effort = "xhigh"\n',
+			"utf8",
+		);
 		writeFileSync(join(originalHome, "plugin_cache.sqlite"), "cache\n", "utf8");
 		writeFileSync(join(originalHome, "plugin_cache.sqlite-wal"), "cache wal\n", "utf8");
 		writeFileSync(join(originalHome, "plugin_cache.sqlite-shm"), "cache shm\n", "utf8");
 
-		const result = runWrapper(fixtureRoot, ["exec", "status"], {
+		const result = runWrapper(fixtureRoot, ["exec", "status", "--model", "gpt-5.1"], {
 			CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
 			CODEX_HOME: originalHome,
-			CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
-			CODEX_MULTI_AUTH_TEST_PROXY_BASE_URL: "http://127.0.0.1:4567",
-			CODEX_MULTI_AUTH_TEST_PROXY_MARKER: markerPath,
+			CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "0",
 			CODEX_MULTI_AUTH_TEST_FORCE_SHADOW_SQLITE_SIDECAR_LINK_FAILURE: "1",
 			CODEX_MULTI_AUTH_TEST_FORCE_SHADOW_SIDECAR_PLACEHOLDER_FAILURE: "1",
 			OPENAI_API_KEY: undefined,
@@ -2010,9 +1856,9 @@ describe("codex bin wrapper", () => {
 		expect(output).toContain("simulated SQLite sidecar placeholder failure");
 	});
 
+	// Same compatibility-shadow driver as the test above.
 	it("removes sqlite materialization when a missing sidecar placeholder fails", () => {
 		const fixtureRoot = createWrapperFixture();
-		createRuntimeRotationProxyFixtureModule(fixtureRoot);
 		const fakeBin = createCustomFakeCodexBin(fixtureRoot, [
 			"#!/usr/bin/env node",
 			'const fs = require("node:fs");',
@@ -2026,17 +1872,19 @@ describe("codex bin wrapper", () => {
 			"process.exit(0);",
 		]);
 		const originalHome = join(fixtureRoot, "codex-home");
-		const markerPath = join(fixtureRoot, "proxy-marker.txt");
 		mkdirSync(originalHome, { recursive: true });
+		writeFileSync(
+			join(originalHome, "config.toml"),
+			'model_reasoning_effort = "xhigh"\n',
+			"utf8",
+		);
 		writeFileSync(join(originalHome, "plugin_cache.sqlite"), "cache\n", "utf8");
 		writeFileSync(join(originalHome, "plugin_cache.sqlite-wal"), "cache wal\n", "utf8");
 
-		const result = runWrapper(fixtureRoot, ["exec", "status"], {
+		const result = runWrapper(fixtureRoot, ["exec", "status", "--model", "gpt-5.1"], {
 			CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
 			CODEX_HOME: originalHome,
-			CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
-			CODEX_MULTI_AUTH_TEST_PROXY_BASE_URL: "http://127.0.0.1:4567",
-			CODEX_MULTI_AUTH_TEST_PROXY_MARKER: markerPath,
+			CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "0",
 			CODEX_MULTI_AUTH_TEST_FORCE_SHADOW_SIDECAR_PLACEHOLDER_FAILURE: "1",
 			OPENAI_API_KEY: undefined,
 		});
@@ -2053,6 +1901,8 @@ describe("codex bin wrapper", () => {
 		expect(output).toContain("simulated SQLite sidecar placeholder failure");
 	});
 
+	// Driven through `codex app` for the same reason as the hook-state test: it
+	// is the remaining command that rewrites a shadow `config.toml`.
 	it("inserts the runtime model provider before TOML array tables", () => {
 		const fixtureRoot = createWrapperFixture();
 		createRuntimeRotationProxyFixtureModule(fixtureRoot);
@@ -2070,14 +1920,22 @@ describe("codex bin wrapper", () => {
 			"utf8",
 		);
 
-		const result = runWrapper(fixtureRoot, ["exec", "status"], {
+		const result = runWrapper(fixtureRoot, ["app", "."], {
 			CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
 			CODEX_HOME: originalHome,
 			CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
+			CODEX_MULTI_AUTH_APP_ROTATION_IDLE_MS: "1000",
 			OPENAI_API_KEY: undefined,
 		});
 
 		expect(result.status).toBe(0);
+		// Guard against the ordering assertion passing on a missing provider:
+		// `indexOf` returns -1, which is below every real offset.
+		expect(
+			result.stdout.indexOf(
+				`model_provider = "${RUNTIME_ROTATION_PROXY_PROVIDER_ID}"`,
+			),
+		).toBeGreaterThanOrEqual(0);
 		expect(
 			result.stdout.indexOf(
 				`model_provider = "${RUNTIME_ROTATION_PROXY_PROVIDER_ID}"`,
@@ -2087,6 +1945,8 @@ describe("codex bin wrapper", () => {
 		);
 	});
 
+	// Driven through `codex app`, the remaining command that builds a runtime
+	// rotation shadow home; `exec` runs canonical and never rewrites a config.
 	it("mirrors trusted user hook state into the runtime shadow config", () => {
 		const fixtureRoot = createWrapperFixture();
 		createRuntimeRotationProxyFixtureModule(fixtureRoot);
@@ -2152,10 +2012,11 @@ describe("codex bin wrapper", () => {
 		].join("\r\n");
 		writeFileSync(join(originalHome, "config.toml"), originalConfig, "utf8");
 
-		const result = runWrapper(fixtureRoot, ["exec", "status"], {
+		const result = runWrapper(fixtureRoot, ["app", "."], {
 			CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
 			CODEX_HOME: originalHome,
 			CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
+			CODEX_MULTI_AUTH_APP_ROTATION_IDLE_MS: "1000",
 			OPENAI_API_KEY: undefined,
 		});
 
@@ -4523,13 +4384,19 @@ describe("codex bin wrapper", () => {
 	// Native Codex fills the root `[PROMPT]` slot with the first free token and
 	// still tries a later one as a subcommand: `codex hello exec …` runs exec.
 	// The classifier scans past unknown positionals the same way, so this stays
-	// a noninteractive exec on the isolated shadow home (#673).
+	// a noninteractive exec on the direct forwarding path, not a detached
+	// app-helper launch. The CODEX_CLI_PATH shim is the discriminator: only the
+	// app-helper path installs it (#673).
 	it("classifies a command after a filled prompt slot like native Codex (#673)", () => {
 		const fixtureRoot = createWrapperFixture();
 		createRuntimeRotationProxyFixtureModule(fixtureRoot);
 		const fakeBin = createCustomFakeCodexBin(fixtureRoot, [
 			"#!/usr/bin/env node",
-			"console.log(`SHADOW_HOME_IS_ORIGINAL:${process.env.CODEX_HOME === process.env.ORIGINAL_CODEX_HOME}`);",
+			"console.log(`HOME_IS_ORIGINAL:${process.env.CODEX_HOME === process.env.ORIGINAL_CODEX_HOME}`);",
+			// The app-helper/prompt path stamps a CODEX_CLI_PATH shim; the
+			// noninteractive path never does. Both now run on the canonical home,
+			// so the shim is what distinguishes them.
+			"console.log(`CLI_PATH_IS_SHIM:${(process.env.CODEX_CLI_PATH ?? \"\").includes(\"app-server-shims\")}`);",
 			"process.exit(0);",
 		]);
 		const originalHome = join(fixtureRoot, "codex-home");
@@ -4554,18 +4421,23 @@ describe("codex bin wrapper", () => {
 		if (result.status !== 0) {
 			throw new Error(output);
 		}
-		expect(output).toContain("SHADOW_HOME_IS_ORIGINAL:false");
+		expect(output).toContain("HOME_IS_ORIGINAL:true");
+		expect(output).toContain("CLI_PATH_IS_SHIM:false");
 	});
 
 	// The alias resolves through the same allowlist as its canonical command, so
 	// `codex e ...` must classify exactly like `codex exec ...` — a real
-	// noninteractive request on the isolated shadow home, not a prompt (#673).
-	it("keeps the `e` exec alias on the shadow Codex home (#673)", () => {
+	// noninteractive request on the direct forwarding path, not a prompt (#673).
+	it("keeps the `e` exec alias on the direct forwarding path (#673)", () => {
 		const fixtureRoot = createWrapperFixture();
 		createRuntimeRotationProxyFixtureModule(fixtureRoot);
 		const fakeBin = createCustomFakeCodexBin(fixtureRoot, [
 			"#!/usr/bin/env node",
-			"console.log(`SHADOW_HOME_IS_ORIGINAL:${process.env.CODEX_HOME === process.env.ORIGINAL_CODEX_HOME}`);",
+			"console.log(`HOME_IS_ORIGINAL:${process.env.CODEX_HOME === process.env.ORIGINAL_CODEX_HOME}`);",
+			// The app-helper/prompt path stamps a CODEX_CLI_PATH shim; the
+			// noninteractive path never does. Both now run on the canonical home,
+			// so the shim is what distinguishes them.
+			"console.log(`CLI_PATH_IS_SHIM:${(process.env.CODEX_CLI_PATH ?? \"\").includes(\"app-server-shims\")}`);",
 			"process.exit(0);",
 		]);
 		const originalHome = join(fixtureRoot, "codex-home");
@@ -4590,7 +4462,8 @@ describe("codex bin wrapper", () => {
 		if (result.status !== 0) {
 			throw new Error(output);
 		}
-		expect(output).toContain("SHADOW_HOME_IS_ORIGINAL:false");
+		expect(output).toContain("HOME_IS_ORIGINAL:true");
+		expect(output).toContain("CLI_PATH_IS_SHIM:false");
 	});
 
 	// The other alias: `a` resolves to `apply`, which makes no model requests,
@@ -4651,7 +4524,8 @@ describe("codex bin wrapper", () => {
 			createRuntimeRotationProxyFixtureModule(fixtureRoot);
 			const fakeBin = createCustomFakeCodexBin(fixtureRoot, [
 				"#!/usr/bin/env node",
-				"console.log(`SHADOW_HOME_IS_ORIGINAL:${process.env.CODEX_HOME === process.env.ORIGINAL_CODEX_HOME}`);",
+				"console.log(`HOME_IS_ORIGINAL:${process.env.CODEX_HOME === process.env.ORIGINAL_CODEX_HOME}`);",
+				"console.log(`CLI_PATH_IS_SHIM:${(process.env.CODEX_CLI_PATH ?? \"\").includes(\"app-server-shims\")}`);",
 				"process.exit(0);",
 			]);
 			const originalHome = join(fixtureRoot, "codex-home");
@@ -4676,7 +4550,8 @@ describe("codex bin wrapper", () => {
 			if (result.status !== 0) {
 				throw new Error(output);
 			}
-			expect(output).toContain("SHADOW_HOME_IS_ORIGINAL:false");
+			expect(output).toContain("HOME_IS_ORIGINAL:true");
+			expect(output).toContain("CLI_PATH_IS_SHIM:false");
 		});
 	}
 
@@ -4891,16 +4766,20 @@ describe("codex bin wrapper", () => {
 		expect(existsSync(markerPath)).toBe(true);
 	});
 
-	// Guards the other half of the split: non-interactive request commands must keep
-	// using the isolated shadow home, so widening the interactive classification
-	// cannot silently move `exec`/`review` onto the canonical home.
+	// Guards the other half of the split: non-interactive request commands must
+	// keep taking the direct forwarding path, so widening the interactive
+	// classification cannot silently turn `exec`/`review` into detached
+	// app-helper launches. Both halves now run on the canonical CODEX_HOME, so
+	// the CODEX_CLI_PATH shim — installed only by the app-helper path — is what
+	// distinguishes them.
 	for (const command of ["exec", "review"] as const) {
-		it(`keeps \`${command}\` on the shadow Codex home (#647)`, () => {
+		it(`keeps \`${command}\` on the direct forwarding path (#647)`, () => {
 			const fixtureRoot = createWrapperFixture();
 			createRuntimeRotationProxyFixtureModule(fixtureRoot);
 			const fakeBin = createCustomFakeCodexBin(fixtureRoot, [
 				"#!/usr/bin/env node",
-				"console.log(`SHADOW_HOME_IS_ORIGINAL:${process.env.CODEX_HOME === process.env.ORIGINAL_CODEX_HOME}`);",
+				"console.log(`HOME_IS_ORIGINAL:${process.env.CODEX_HOME === process.env.ORIGINAL_CODEX_HOME}`);",
+				"console.log(`CLI_PATH_IS_SHIM:${(process.env.CODEX_CLI_PATH ?? \"\").includes(\"app-server-shims\")}`);",
 				"process.exit(0);",
 			]);
 			const originalHome = join(fixtureRoot, "codex-home");
@@ -4925,7 +4804,8 @@ describe("codex bin wrapper", () => {
 			if (result.status !== 0) {
 				throw new Error(output);
 			}
-			expect(output).toContain("SHADOW_HOME_IS_ORIGINAL:false");
+			expect(output).toContain("HOME_IS_ORIGINAL:true");
+			expect(output).toContain("CLI_PATH_IS_SHIM:false");
 		});
 	}
 
