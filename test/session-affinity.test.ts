@@ -87,10 +87,68 @@ describe("SessionAffinityStore", () => {
 		const store = new SessionAffinityStore({ ttlMs: 60_000, maxEntries: 10 });
 		store.remember("s1", 0, 1_000);
 		store.forgetSession("   ");
-		store.forgetSession("s1");
+		store.forgetSessionWithVersion("s1", 1_500);
 
 		expect(store.getPreferredAccountIndex("s1", 2_000)).toBeNull();
+		// The forget is recorded as a versioned tombstone (it expires with the
+		// ttl), so a stale pre-forget write cannot resurrect the mapping.
+		expect(store.size()).toBe(1);
+		expect(store.prune(1_500 + 60_001)).toBe(1);
 		expect(store.size()).toBe(0);
+	});
+
+	it("a stale remember cannot resurrect a forgotten session", () => {
+		const store = new SessionAffinityStore({ ttlMs: 60_000, maxEntries: 10 });
+		store.rememberWithVersion("s1", 0, 1_000, 10);
+		store.forgetSessionWithVersion("s1", 1_500, 20);
+
+		// In-flight request that allocated its version before the forget.
+		store.rememberWithVersion("s1", 1, 2_000, 15);
+		expect(store.getPreferredAccountIndex("s1", 2_500)).toBeNull();
+
+		// A genuinely newer remember revives the session.
+		store.rememberWithVersion("s1", 2, 3_000, 25);
+		expect(store.getPreferredAccountIndex("s1", 3_500)).toBe(2);
+	});
+
+	it("a delete wins over a remember at the same write version", () => {
+		const store = new SessionAffinityStore({ ttlMs: 60_000, maxEntries: 10 });
+		store.forgetSessionWithVersion("s1", 1_000, 20);
+		store.rememberWithVersion("s1", 1, 1_500, 20);
+
+		expect(store.getPreferredAccountIndex("s1", 2_000)).toBeNull();
+	});
+
+	it("a tombstone hides the last response id and blocks stale updates", () => {
+		const store = new SessionAffinityStore({ ttlMs: 60_000, maxEntries: 10 });
+		store.rememberWithVersion("s1", 0, 1_000, 10);
+		store.updateLastResponseId("s1", "resp_1", 1_200, 11);
+		store.forgetSessionWithVersion("s1", 1_500, 20);
+
+		expect(store.getLastResponseId("s1", 2_000)).toBeNull();
+		store.updateLastResponseId("s1", "resp_stale", 2_100, 15);
+		expect(store.getLastResponseId("s1", 2_200)).toBeNull();
+	});
+
+	it("an implicit-version forget still beats every earlier write", () => {
+		const store = new SessionAffinityStore({ ttlMs: 60_000, maxEntries: 10 });
+		store.rememberWithVersion("s1", 0, 1_000, 100);
+		store.forgetSession("s1");
+		store.rememberWithVersion("s1", 1, 2_000, 100);
+
+		expect(store.getPreferredAccountIndex("s1", 2_500)).toBeNull();
+	});
+
+	it("clearAllWithVersion raises a floor that refuses pre-reset writes", () => {
+		const store = new SessionAffinityStore({ ttlMs: 60_000, maxEntries: 10 });
+		store.rememberWithVersion("s1", 0, 1_000, 5);
+		store.clearAllWithVersion(30);
+
+		expect(store.getPreferredAccountIndex("s1", 1_500)).toBeNull();
+		store.rememberWithVersion("s2", 1, 2_000, 29);
+		expect(store.getPreferredAccountIndex("s2", 2_500)).toBeNull();
+		store.rememberWithVersion("s3", 2, 3_000, 31);
+		expect(store.getPreferredAccountIndex("s3", 3_500)).toBe(2);
 	});
 
 	it("returns zero for invalid forget/reindex requests", () => {

@@ -13,6 +13,13 @@ interface SessionAffinityEntry {
 	lastResponseId?: string;
 	updatedAt: number;
 	writeVersion: number;
+	/**
+	 * A versioned tombstone: the session was forgotten at `writeVersion`. The
+	 * entry keeps occupying its key until it expires so that a stale write from
+	 * before the delete cannot resurrect the mapping (a plain `Map.delete`
+	 * erases the ordering evidence the write-version protocol relies on).
+	 */
+	deleted?: boolean;
 }
 
 const DEFAULT_TTL_MS = 20 * 60 * 1000;
@@ -44,6 +51,12 @@ export class SessionAffinityStore {
 	private readonly maxEntries: number;
 	private readonly entries = new Map<string, SessionAffinityEntry>();
 	private writeVersionCounter = 0;
+	/**
+	 * Writes below this floor are refused outright. Raised by
+	 * `clearAllWithVersion` so a request that predates a manual
+	 * affinity-generation reset cannot resurrect a cleared mapping.
+	 */
+	private writeVersionFloor = 0;
 
 	constructor(options: SessionAffinityOptions = {}) {
 		this.ttlMs = Math.max(1_000, Math.floor(options.ttlMs ?? DEFAULT_TTL_MS));
@@ -60,6 +73,7 @@ export class SessionAffinityStore {
 			this.entries.delete(key);
 			return null;
 		}
+		if (entry.deleted === true) return null;
 		return entry.accountIndex;
 	}
 
@@ -77,12 +91,15 @@ export class SessionAffinityStore {
 		if (!key) return;
 		if (!Number.isFinite(accountIndex) || accountIndex < 0) return;
 		const normalizedWriteVersion = this.normalizeWriteVersion(writeVersion);
+		if (normalizedWriteVersion < this.writeVersionFloor) return;
 
 		const existingEntry = this.entries.get(key);
 		if (
 			existingEntry &&
 			existingEntry.expiresAt > now &&
-			existingEntry.writeVersion > normalizedWriteVersion
+			(existingEntry.writeVersion > normalizedWriteVersion ||
+				(existingEntry.deleted === true &&
+					existingEntry.writeVersion === normalizedWriteVersion))
 		) {
 			return;
 		}
@@ -106,6 +123,7 @@ export class SessionAffinityStore {
 			this.entries.delete(key);
 			return null;
 		}
+		if (entry.deleted === true) return null;
 
 		const lastResponseId =
 			typeof entry.lastResponseId === "string" ? entry.lastResponseId.trim() : "";
@@ -136,9 +154,10 @@ export class SessionAffinityStore {
 		const normalizedResponseId = typeof responseId === "string" ? responseId.trim() : "";
 		if (!key || !normalizedResponseId) return;
 		const normalizedWriteVersion = this.normalizeWriteVersion(writeVersion);
+		if (normalizedWriteVersion < this.writeVersionFloor) return;
 
 		const entry = this.entries.get(key);
-		if (!entry) return;
+		if (!entry || entry.deleted === true) return;
 		if (entry.expiresAt <= now) {
 			this.entries.delete(key);
 			return;
@@ -157,9 +176,43 @@ export class SessionAffinityStore {
 	}
 
 	forgetSession(sessionKey: string | null | undefined): void {
+		this.forgetSessionWithVersion(sessionKey);
+	}
+
+	/**
+	 * Forget a session through the write-version protocol. A delete must
+	 * participate in the same arrival ordering as a remember: a plain map
+	 * delete lets a slower request that selected its account *before* the
+	 * forget re-publish the mapping *after* it, resurrecting affinity to an
+	 * account the store already decided to abandon. The tombstone records the
+	 * delete's version so only a genuinely newer remember can revive the key.
+	 */
+	forgetSessionWithVersion(
+		sessionKey: string | null | undefined,
+		now = Date.now(),
+		writeVersion?: number,
+	): void {
 		const key = normalizeSessionKey(sessionKey);
 		if (!key) return;
-		this.entries.delete(key);
+		const normalizedWriteVersion = this.normalizeWriteVersion(writeVersion);
+		if (normalizedWriteVersion < this.writeVersionFloor) return;
+
+		const existingEntry = this.entries.get(key);
+		if (
+			existingEntry &&
+			existingEntry.expiresAt > now &&
+			existingEntry.writeVersion > normalizedWriteVersion
+		) {
+			return;
+		}
+
+		this.setEntry(key, {
+			accountIndex: -1,
+			deleted: true,
+			expiresAt: now + this.ttlMs,
+			updatedAt: now,
+			writeVersion: normalizedWriteVersion,
+		});
 	}
 
 	forgetAccount(accountIndex: number): number {
@@ -212,6 +265,22 @@ export class SessionAffinityStore {
 	clearAll(): void {
 		if (this.entries.size === 0) return;
 		this.entries.clear();
+	}
+
+	/**
+	 * Drop every entry written at or below `writeVersion` and raise the write
+	 * floor to it, so an in-flight request that allocated its version before
+	 * the reset can no longer resurrect a cleared mapping afterwards. Callers
+	 * that can order their writes should prefer this over `clearAll`.
+	 */
+	clearAllWithVersion(writeVersion: number): void {
+		const normalizedWriteVersion = this.normalizeWriteVersion(writeVersion);
+		this.writeVersionFloor = Math.max(this.writeVersionFloor, normalizedWriteVersion);
+		for (const [key, entry] of this.entries.entries()) {
+			if (entry.writeVersion <= normalizedWriteVersion) {
+				this.entries.delete(key);
+			}
+		}
 	}
 
 	size(): number {
