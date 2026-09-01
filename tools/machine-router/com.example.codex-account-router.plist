@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.example.codex-account-router</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/zsh</string>
+    <string>-c</string>
+    <string>exec node "$HOME/tools/codex-multi-auth/tools/machine-router/codex-router-daemon.mjs" &gt;&gt;"$HOME/Library/Logs/codex-account-router.log" 2&gt;&amp;1</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>AGENT_CODEX_ROUTER_PORT</key>
+    <string>17892</string>
+    <key>AGENT_CODEX_ROUTER_MODULE_PATH</key>
+    <string>/opt/homebrew/lib/node_modules/codex-multi-auth/dist/lib/runtime-rotation-proxy.js</string>
+    <key>CODEX_AUTH_PREEMPTIVE_QUOTA_MAX_DEFERRAL_MS</key>
+    <string>900000</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+</dict>
+</plist>
