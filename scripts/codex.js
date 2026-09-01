@@ -1840,7 +1840,12 @@ async function forwardToRealCodex(codexBin, rawArgs, baseEnv = process.env) {
 		);
 		lastExitCode = result.exitCode;
 		if (result.exitCode === 0) {
-			repairCodexSessionIndex(resolveCodexHomeDir(baseEnv));
+			// codex-multi-auth local compatibility: canonical index needs no full
+			// post-run repair. Forwarded runs now stay on the canonical CODEX_HOME,
+			// so official Codex has already written its own index entry by the time
+			// this returns. Re-scanning every transcript here is a second full pass
+			// that can retain multiple gigabytes and keeps `codex exec` alive well
+			// past its final answer.
 			return result.exitCode;
 		}
 
@@ -5049,7 +5054,14 @@ async function createRuntimeRotationProxyContextIfEnabled(
 	try {
 		const clientApiKey = createRuntimeRotationProxyClientApiKey();
 		proxyServer = await proxyModule.startRuntimeRotationProxy({ clientApiKey });
-		shadowContext = createRuntimeRotationProxyCodexHome(
+		// codex-multi-auth local compatibility: reuse canonical Codex index for exec.
+		// A fresh shadow home omits `state_*.sqlite`, so official Codex rebuilds its
+		// complete session index before every prompt — an unbounded scan of every
+		// transcript that reads as an endless `Working` state with no request in
+		// flight. The canonical home keeps that index; the `-c` provider args this
+		// helper returns keep the rotation provider isolated from the user's own
+		// `config.toml` instead of relying on a rewritten copy inside a shadow.
+		shadowContext = createRuntimeRotationProxyCanonicalCodexHome(
 			baseContext.env,
 			proxyServer.baseUrl,
 			clientApiKey,
@@ -5082,6 +5094,7 @@ async function createRuntimeRotationProxyContextIfEnabled(
 	return {
 		args: [
 			...baseContext.args,
+			...(shadowContext.args ?? []),
 			"-c",
 			`model_provider=${configTomlModule.tomlStringLiteral(RUNTIME_ROTATION_PROXY_PROVIDER_ID)}`,
 		],
@@ -5687,177 +5700,6 @@ function normalizeExitCode(value) {
 		return parsed;
 	}
 	return 1;
-}
-
-function extractRolloutIdFromFilename(fileName) {
-	const match = fileName.match(
-		/^rollout-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i,
-	);
-	return match?.[1] ?? null;
-}
-
-function collectRolloutFiles(rootDir, results = []) {
-	let entries = [];
-	try {
-		entries = readdirSync(rootDir, { withFileTypes: true });
-	} catch {
-		return results;
-	}
-	for (const entry of entries) {
-		const entryPath = join(rootDir, entry.name);
-		if (entry.isDirectory()) {
-			collectRolloutFiles(entryPath, results);
-			continue;
-		}
-		if (entry.isFile() && extractRolloutIdFromFilename(entry.name)) {
-			results.push(entryPath);
-		}
-	}
-	return results;
-}
-
-function parseRolloutIndexEntry(rolloutPath) {
-	const fileName = basename(rolloutPath);
-	const idFromName = extractRolloutIdFromFilename(fileName);
-	if (!idFromName) return null;
-	let content = "";
-	try {
-		content = readFileSync(rolloutPath, "utf8");
-	} catch {
-		return null;
-	}
-	const lines = content.split(/\r?\n/).filter(Boolean);
-	let id = idFromName;
-	let threadName = "";
-	let updatedAt = null;
-	let hasSessionMeta = false;
-	for (const line of lines) {
-		let record;
-		try {
-			record = JSON.parse(line);
-		} catch {
-			continue;
-		}
-		if (typeof record?.timestamp === "string") {
-			updatedAt = record.timestamp;
-		}
-		if (record?.type === "session_meta" && typeof record.payload?.id === "string") {
-			id = record.payload.id;
-			hasSessionMeta = true;
-		}
-		if (!threadName && record?.type === "event_msg") {
-			const message = record.payload?.message;
-			if (typeof message === "string" && message.trim().length > 0) {
-				threadName = message.trim();
-			}
-		}
-	}
-	if (!updatedAt) {
-		try {
-			updatedAt = statSync(rolloutPath).mtime.toISOString();
-		} catch {
-			updatedAt = new Date().toISOString();
-		}
-	}
-	if (!threadName) {
-		threadName = "Codex session";
-	}
-	if (!hasSessionMeta) {
-		return null;
-	}
-	if (threadName.length > 80) {
-		threadName = `${threadName.slice(0, 77)}...`;
-	}
-	return { id, thread_name: threadName, updated_at: updatedAt };
-}
-
-function writeSessionIndexAtomicSync(indexPath, lines) {
-	const indexDir = dirname(indexPath);
-	mkdirSync(indexDir, { recursive: true });
-	for (let attempt = 0; attempt <= SHADOW_HOME_CLEANUP_BACKOFF_MS.length; attempt += 1) {
-		const tempPath = join(
-			indexDir,
-			[
-				`.${basename(indexPath)}`,
-				String(process.pid),
-				String(Date.now()),
-				randomBytes(4).toString("hex"),
-				"tmp",
-			].join("."),
-		);
-		try {
-			writeFileSync(tempPath, `${lines.join("\n")}\n`, {
-				encoding: "utf8",
-				mode: 0o600,
-			});
-			chmodSync(tempPath, 0o600);
-			renameSync(tempPath, indexPath);
-			chmodSync(indexPath, 0o600);
-			return;
-		} catch (error) {
-			try {
-				rmSync(tempPath, { force: true });
-			} catch {
-				// Preserve the original write failure.
-			}
-			if (
-				isRetryableShadowHomeCleanupError(error) &&
-				attempt < SHADOW_HOME_CLEANUP_BACKOFF_MS.length
-			) {
-				sleepSync(SHADOW_HOME_CLEANUP_BACKOFF_MS[attempt]);
-				continue;
-			}
-			throw error;
-		}
-	}
-}
-
-function repairCodexSessionIndex(codexHome) {
-	if (!codexHome || typeof codexHome !== "string") return;
-	const sessionsDir = join(codexHome, "sessions");
-	if (!existsSync(sessionsDir)) return;
-	const indexPath = join(codexHome, "session_index.jsonl");
-	let releaseLock = null;
-	try {
-		releaseLock = acquireShadowHomeSyncLock(codexHome);
-		const seen = new Set();
-		let existingLines = [];
-		if (existsSync(indexPath)) {
-			existingLines = readFileSync(indexPath, "utf8")
-				.split(/\r?\n/)
-				.filter(Boolean);
-			for (const line of existingLines) {
-				try {
-					const entry = JSON.parse(line);
-					if (typeof entry?.id === "string") {
-						seen.add(entry.id);
-					}
-				} catch {
-					// Preserve unparsable existing lines.
-				}
-			}
-		}
-
-		const additions = [];
-		for (const rolloutPath of collectRolloutFiles(sessionsDir)) {
-			const idFromName = extractRolloutIdFromFilename(basename(rolloutPath));
-			if (idFromName && seen.has(idFromName)) continue;
-			const entry = parseRolloutIndexEntry(rolloutPath);
-			if (!entry || seen.has(entry.id)) continue;
-			seen.add(entry.id);
-			additions.push(entry);
-		}
-		if (additions.length === 0) return;
-		additions.sort((a, b) => a.updated_at.localeCompare(b.updated_at));
-		writeSessionIndexAtomicSync(indexPath, [
-			...existingLines,
-			...additions.map((entry) => JSON.stringify(entry)),
-		]);
-	} catch {
-		// Best-effort repair only; forwarding must not fail because indexing did.
-	} finally {
-		releaseLock?.();
-	}
 }
 
 const WINDOWS_SHIM_MARKER = "codex-multi-auth windows shim guardian v1";
