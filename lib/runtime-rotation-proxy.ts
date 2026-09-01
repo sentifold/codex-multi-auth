@@ -329,8 +329,18 @@ function createOutboundHeaders(
 	headers.delete("proxy-authorization");
 	headers.set("authorization", `Bearer ${accessToken}`);
 	headers.set(OPENAI_HEADERS.ACCOUNT_ID, accountId);
-	headers.set(OPENAI_HEADERS.BETA, OPENAI_HEADER_VALUES.BETA_RESPONSES);
-	headers.set(OPENAI_HEADERS.ORIGINATOR, OPENAI_HEADER_VALUES.ORIGINATOR_CODEX);
+	// The client states its own identity: `originator` and the OpenAI-Beta
+	// contract are entitlement-relevant (newer model tiers are keyed to the
+	// client identity that requested them), so overwriting them downgrades an
+	// official Codex client to the legacy identity and can fail entitlement
+	// checks for models the account actually supports. Preserve the incoming
+	// values and fill the legacy defaults only for clients that sent none.
+	if (!headers.has(OPENAI_HEADERS.BETA)) {
+		headers.set(OPENAI_HEADERS.BETA, OPENAI_HEADER_VALUES.BETA_RESPONSES);
+	}
+	if (!headers.has(OPENAI_HEADERS.ORIGINATOR)) {
+		headers.set(OPENAI_HEADERS.ORIGINATOR, OPENAI_HEADER_VALUES.ORIGINATOR_CODEX);
+	}
 	return headers;
 }
 
