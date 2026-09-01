@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
 	PreemptiveQuotaScheduler,
+	isObservedRateLimitDeferral,
 	readQuotaSchedulerSnapshot,
 } from "../lib/preemptive-quota-scheduler.js";
 
@@ -213,10 +214,15 @@ describe("preemptive quota scheduler", () => {
 		expect(decision.waitMs).toBe(sevenDaysMs);
 	});
 
+	// An exhaustion claim with no trusted reset is unfalsifiable, so it is
+	// trusted for one deferral cap measured from the snapshot that produced it
+	// — a fixed deadline. Previously the cap was measured from `now`, which
+	// re-armed the full wait on every poll: the account was never selected, so
+	// no fresher snapshot could arrive to release it, and only a restart did.
 	it.each([
 		["missing", undefined],
 		["invalid", Number.NaN],
-	] as const)("falls back to the configured cap for %s reset data", (_label, resetAtMs) => {
+	] as const)("caps %s reset data at a horizon fixed to the snapshot", (_label, resetAtMs) => {
 		const maxDeferralMs = 30 * 60_000;
 		const scheduler = new PreemptiveQuotaScheduler({ maxDeferralMs });
 		const now = 1_000_000;
@@ -227,13 +233,18 @@ describe("preemptive quota scheduler", () => {
 			updatedAt: now,
 		});
 
-		const decision = scheduler.getDeferral("acc:model", now + 1_000);
-
-		expect(decision).toEqual({
+		expect(scheduler.getDeferral("acc:model", now + 1_000)).toEqual({
 			defer: true,
-			waitMs: maxDeferralMs,
+			waitMs: maxDeferralMs - 1_000,
 			reason: "quota-near-exhaustion",
 		});
+
+		// The deadline does not slide: later polls report less time, not the
+		// same cap again.
+		expect(scheduler.getDeferral("acc:model", now + 20 * 60_000).waitMs).toBe(
+			maxDeferralMs - 20 * 60_000,
+		);
+		expect(scheduler.getDeferral("acc:model", now + maxDeferralMs + 1).defer).toBe(false);
 	});
 
 	it("falls back to the configured cap for stale reset data", () => {
@@ -412,4 +423,104 @@ describe("preemptive quota scheduler", () => {
 		expect(after.reason).not.toBe("rate-limit");
 	});
 
+	describe("advisory deferrals expire on a fixed probe horizon", () => {
+		const HOUR = 60 * 60_000;
+
+		it("releases a near-exhaustion deferral once the horizon lapses", () => {
+			const scheduler = new PreemptiveQuotaScheduler({ maxDeferralMs: 15 * 60_000 });
+			const now = 1_000_000;
+			const weekMs = 7 * 24 * 60 * 60 * 1000;
+			// Near its ceiling but NOT proven exhausted: still has quota left.
+			scheduler.update("acc:model", {
+				status: 200,
+				primary: { usedPercent: 97, resetAtMs: now + weekMs },
+				secondary: {},
+				updatedAt: now,
+			});
+
+			const immediately = scheduler.getDeferral("acc:model", now + 1_000);
+			expect(immediately.defer).toBe(true);
+			expect(immediately.reason).toBe("quota-near-exhaustion");
+			// Bounded by the horizon, not by the week-long window reset.
+			expect(immediately.waitMs).toBeLessThanOrEqual(15 * 60_000);
+
+			// The horizon is measured from the snapshot, so it is a fixed deadline
+			// rather than one that slides forward on every poll.
+			const later = scheduler.getDeferral("acc:model", now + 10 * 60_000);
+			expect(later.waitMs).toBeLessThanOrEqual(5 * 60_000);
+
+			const lapsed = scheduler.getDeferral("acc:model", now + 15 * 60_000 + 1);
+			expect(lapsed.defer).toBe(false);
+			expect(lapsed.waitMs).toBe(0);
+		});
+
+		it("keeps the full window when exhaustion is proven (issue #656)", () => {
+			const scheduler = new PreemptiveQuotaScheduler({ maxDeferralMs: 15 * 60_000 });
+			const now = 1_000_000;
+			// 100% used with a known reset still ahead: evidence, not inference.
+			scheduler.update("acc:model", {
+				status: 200,
+				primary: { usedPercent: 100, resetAtMs: now + 6 * HOUR },
+				secondary: {},
+				updatedAt: now,
+			});
+
+			const decision = scheduler.getDeferral("acc:model", now + 60_000);
+			expect(decision.defer).toBe(true);
+			expect(decision.reason).toBe("quota-near-exhaustion");
+			// Not clamped to the 15m horizon — the proven window stands in full.
+			expect(decision.waitMs).toBeGreaterThan(5 * HOUR);
+
+			// Still deferred well past the horizon, because the claim is falsifiable
+			// and has not yet expired.
+			const afterHorizon = scheduler.getDeferral("acc:model", now + HOUR);
+			expect(afterHorizon.defer).toBe(true);
+		});
+
+		it("bounds an exhaustion claim that carries no trusted reset", () => {
+			const scheduler = new PreemptiveQuotaScheduler({ maxDeferralMs: 15 * 60_000 });
+			const now = 1_000_000;
+			// Claims 100% used but states no reset: unfalsifiable. Without a
+			// horizon this defers forever, because the account is never selected
+			// and so no fresher snapshot can ever arrive to release it.
+			scheduler.update("acc:model", {
+				status: 200,
+				primary: { usedPercent: 100 },
+				secondary: {},
+				updatedAt: now,
+			});
+
+			expect(scheduler.getDeferral("acc:model", now + 1_000).defer).toBe(true);
+			const lapsed = scheduler.getDeferral("acc:model", now + 15 * 60_000 + 1);
+			expect(lapsed.defer).toBe(false);
+		});
+
+		it("never shortens a deferral produced by a real 429", () => {
+			const scheduler = new PreemptiveQuotaScheduler({ maxDeferralMs: 15 * 60_000 });
+			const now = 1_000_000;
+			scheduler.markRateLimited("acc:model", 45 * 60_000, now);
+
+			const decision = scheduler.getDeferral("acc:model", now + 60_000);
+			expect(decision.reason).toBe("rate-limit");
+			// The 429 branch keeps its own cap semantics; the advisory horizon
+			// must not touch a server-stated window.
+			expect(decision.waitMs).toBeGreaterThan(10 * 60_000);
+		});
+	});
+
+	describe("isObservedRateLimitDeferral", () => {
+		it("separates an observed 429 from a derived routing preference", () => {
+			expect(isObservedRateLimitDeferral({ defer: true, waitMs: 1, reason: "rate-limit" })).toBe(
+				true,
+			);
+			expect(
+				isObservedRateLimitDeferral({
+					defer: true,
+					waitMs: 1,
+					reason: "quota-near-exhaustion",
+				}),
+			).toBe(false);
+			expect(isObservedRateLimitDeferral({ defer: false, waitMs: 0 })).toBe(false);
+		});
+	});
 });

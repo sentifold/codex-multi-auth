@@ -57,6 +57,7 @@ import { createUsageStreamScanner } from "./usage/usage-extraction.js";
 import { isWorkspaceDisabledError } from "./request/fetch-helpers.js";
 import {
 	PreemptiveQuotaScheduler,
+	isObservedRateLimitDeferral,
 	readQuotaSchedulerSnapshot,
 } from "./preemptive-quota-scheduler.js";
 import { ContextBudgetGuard } from "./context-budget-guard.js";
@@ -1324,15 +1325,27 @@ async function handleRequestInner(
 					preemptiveDeferral.reason ?? "quota-near-exhaustion",
 				);
 				exhaustionReason = "rate-limit";
-				accountManager.markRateLimitedWithReason(
-					selected,
-					preemptiveDeferral.waitMs,
-					context.family,
-					"quota",
-					context.model,
-				);
-				accountManager.recordRateLimit(selected, context.family, context.model);
-				accountManager.saveToDiskDebounced();
+				// Only an observed 429 earns a persisted rate-limit window. An
+				// advisory near-exhaustion signal is a routing preference, and
+				// writing it here made it durable: clearExpiredRateLimits only
+				// drops such a record once the whole window elapses (days, on a
+				// weekly window), a later healthy 200 never clears it, and it is
+				// serialized to disk so it outlives every restart. One brush with
+				// a near-exhausted window therefore benched a still-usable account
+				// for days while it answered 200 to a direct probe. The scheduler
+				// already withholds selection for the advisory horizon, so
+				// skipping the write strands nothing.
+				if (isObservedRateLimitDeferral(preemptiveDeferral)) {
+					accountManager.markRateLimitedWithReason(
+						selected,
+						preemptiveDeferral.waitMs,
+						context.family,
+						"quota",
+						context.model,
+					);
+					accountManager.recordRateLimit(selected, context.family, context.model);
+					accountManager.saveToDiskDebounced();
+				}
 				noteRotation();
 				continue;
 			}
@@ -1745,15 +1758,21 @@ async function handleRequestInner(
 				? quotaDeferral.waitMs
 				: 0;
 			if (nearExhaustionWaitMs > 0) {
-				accountManager.markRateLimitedWithReason(
-					refreshed.account,
-					nearExhaustionWaitMs,
-					context.family,
-					"quota",
-					context.model,
-				);
+				// Drop session affinity either way: a request that just proved this
+				// account near its ceiling should not keep steering later turns here.
+				// But only an observed 429 earns a persisted rate-limit window --
+				// see the selection branch above.
+				if (isObservedRateLimitDeferral(quotaDeferral)) {
+					accountManager.markRateLimitedWithReason(
+						refreshed.account,
+						nearExhaustionWaitMs,
+						context.family,
+						"quota",
+						context.model,
+					);
+					accountManager.saveToDiskDebounced();
+				}
 				state.sessionAffinityStore?.forgetSession(context.sessionKey);
-				accountManager.saveToDiskDebounced();
 			} else {
 				state.sessionAffinityStore?.remember(
 					context.sessionKey,
