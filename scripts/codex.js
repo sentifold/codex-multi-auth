@@ -4969,16 +4969,20 @@ async function createRuntimeRotationProxyContextIfEnabled(
 
 	const configTomlModule = await loadRuntimeConfigTomlModule();
 	if (!configTomlModule) {
-		console.error(
-			"codex-multi-auth runtime rotation config helpers are unavailable; continuing without runtime rotation.",
-		);
-		return baseContext;
+		// codex-multi-auth local compatibility: runtime account router is mandatory.
+		// Rotation was explicitly requested; falling back to the caller's single
+		// account looks identical to a working rotation until that one account
+		// absorbs every request and hits its limit.
+		baseContext.cleanup?.();
+		return {
+			startupError:
+				"codex-multi-auth runtime rotation config helpers are unavailable; refusing single-account fallback.",
+		};
 	}
 
-	// A helper that cannot start is a hard failure for these branches — unlike the
-	// shadow path below, there is no rotation-off shape left to degrade into. Turn
-	// it into a diagnostic and a nonzero exit rather than an unhandled rejection,
-	// and release the compatibility shadow home the caller already built.
+	// A helper that cannot start is a hard failure for every branch below. Turn it
+	// into a diagnostic and a nonzero exit rather than an unhandled rejection, and
+	// release the compatibility shadow home the caller already built.
 	const startAppHelperContext = async (options) => {
 		try {
 			return await createRuntimeRotationAppHelperContext(
@@ -5038,10 +5042,11 @@ async function createRuntimeRotationProxyContextIfEnabled(
 
 	const proxyModule = await loadRuntimeRotationProxyModule();
 	if (!proxyModule) {
-		console.error(
-			"codex-multi-auth runtime rotation proxy is unavailable; continuing without runtime rotation.",
-		);
-		return baseContext;
+		baseContext.cleanup?.();
+		return {
+			startupError:
+				"codex-multi-auth runtime rotation proxy is unavailable; refusing single-account fallback.",
+		};
 	}
 
 	let proxyServer;
@@ -5061,10 +5066,10 @@ async function createRuntimeRotationProxyContextIfEnabled(
 		} catch {
 			// Best-effort cleanup only.
 		}
-		console.error(
-			`codex-multi-auth runtime rotation proxy failed to start; continuing without runtime rotation: ${error instanceof Error ? error.message : String(error)}`,
-		);
-		return baseContext;
+		baseContext.cleanup?.();
+		return {
+			startupError: `codex-multi-auth runtime rotation proxy failed to start; refusing single-account fallback: ${error instanceof Error ? error.message : String(error)}`,
+		};
 	}
 
 	const cleanup = async () => {

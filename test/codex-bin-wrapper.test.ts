@@ -1634,6 +1634,84 @@ describe("codex bin wrapper", () => {
 		);
 	});
 
+	// Rotation is the whole point of the wrapper. When it is requested and cannot
+	// be established, forwarding anyway routes every request through the single
+	// account that happens to be active — indistinguishable from a working
+	// rotation until that account's quota is gone. Fail closed instead.
+	it("fails closed when runtime rotation config helpers are unavailable", () => {
+		const fixtureRoot = createWrapperFixture();
+		const codexHome = join(fixtureRoot, "codex-home");
+		mkdirSync(codexHome, { recursive: true });
+		const fakeBin = createFakeCodexBin(fixtureRoot);
+		const result = runWrapper(fixtureRoot, ["exec", "status"], {
+			CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
+			CODEX_HOME: codexHome,
+			CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
+			OPENAI_API_KEY: undefined,
+		});
+
+		expect(result.status).toBe(1);
+		expect(result.stderr).toContain(
+			"codex-multi-auth runtime rotation config helpers are unavailable; refusing single-account fallback.",
+		);
+		expect(result.stderr).not.toContain("continuing without runtime rotation");
+		expect(combinedOutput(result)).not.toContain("FORWARDED:");
+	});
+
+	it("fails closed when the runtime rotation proxy module is unavailable", () => {
+		const fixtureRoot = createWrapperFixture();
+		// Config helpers present, proxy module absent: the second fallback site.
+		createRuntimeConfigTomlFixtureModule(fixtureRoot);
+		const codexHome = join(fixtureRoot, "codex-home");
+		mkdirSync(codexHome, { recursive: true });
+		const fakeBin = createFakeCodexBin(fixtureRoot);
+		const result = runWrapper(fixtureRoot, ["exec", "status"], {
+			CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
+			CODEX_HOME: codexHome,
+			CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
+			OPENAI_API_KEY: undefined,
+		});
+
+		expect(result.status).toBe(1);
+		expect(result.stderr).toContain(
+			"codex-multi-auth runtime rotation proxy is unavailable; refusing single-account fallback.",
+		);
+		expect(result.stderr).not.toContain("continuing without runtime rotation");
+		expect(combinedOutput(result)).not.toContain("FORWARDED:");
+	});
+
+	it("fails closed when the runtime rotation proxy fails to start", () => {
+		const fixtureRoot = createWrapperFixture();
+		createRuntimeConfigTomlFixtureModule(fixtureRoot);
+		const distLibDir = join(fixtureRoot, "dist", "lib");
+		mkdirSync(distLibDir, { recursive: true });
+		writeFileSync(
+			join(distLibDir, "runtime-rotation-proxy.js"),
+			[
+				"export async function startRuntimeRotationProxy() {",
+				'  throw new Error("EADDRINUSE_STUB");',
+				"}",
+			].join("\n"),
+			"utf8",
+		);
+		const codexHome = join(fixtureRoot, "codex-home");
+		mkdirSync(codexHome, { recursive: true });
+		const fakeBin = createFakeCodexBin(fixtureRoot);
+		const result = runWrapper(fixtureRoot, ["exec", "status"], {
+			CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
+			CODEX_HOME: codexHome,
+			CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
+			OPENAI_API_KEY: undefined,
+		});
+
+		expect(result.status).toBe(1);
+		expect(result.stderr).toContain(
+			"codex-multi-auth runtime rotation proxy failed to start; refusing single-account fallback: EADDRINUSE_STUB",
+		);
+		expect(result.stderr).not.toContain("continuing without runtime rotation");
+		expect(combinedOutput(result)).not.toContain("FORWARDED:");
+	});
+
 	it("starts the opt-in runtime rotation proxy with a shadow CODEX_HOME provider", () => {
 		const fixtureRoot = createWrapperFixture();
 		createRuntimeRotationProxyFixtureModule(fixtureRoot);
