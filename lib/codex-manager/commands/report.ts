@@ -28,6 +28,7 @@ import {
 	DEFAULT_PROBE_MODEL,
 	getModelCapabilities,
 	getModelProfile,
+	getNormalizedModel,
 	resolveNormalizedModel,
 } from "../../request/helpers/model-map.js";
 import {
@@ -87,7 +88,7 @@ export interface ReportCommandDeps {
 	getStoragePath: () => string;
 	loadAccounts: () => Promise<AccountStorageV3 | null>;
 	saveAccounts: (storage: AccountStorageV3) => Promise<void>;
-	resolveActiveIndex: (storage: AccountStorageV3, family?: "codex") => number;
+	resolveActiveIndex: (storage: AccountStorageV3, family?: ModelFamily) => number;
 	hasUsableAccessToken: (
 		account: Pick<AccountMetadataV3, "accessToken" | "expiresAt">,
 		now: number,
@@ -97,11 +98,12 @@ export interface ReportCommandDeps {
 		accountId: string;
 		accessToken: string;
 		model: string;
+		fallbackModels?: readonly string[];
 	}) => Promise<CodexQuotaSnapshot>;
 	formatRateLimitEntry: (
 		account: AccountStorageV3["accounts"][number],
 		now: number,
-		family: "codex",
+		family: ModelFamily,
 	) => string | null;
 	inspectStorageHealth?: () => Promise<StorageHealthSummary>;
 	normalizeFailureDetail: (
@@ -317,6 +319,10 @@ export async function runReportCommand(
 	}
 	const options = parsedArgs.options;
 	const requestedModel = options.model?.trim() || DEFAULT_PROBE_MODEL;
+	if (options.modelProvided && !getNormalizedModel(requestedModel)) {
+		logError(`Unknown probe model: ${requestedModel}; refusing model substitution`);
+		return 1;
+	}
 	const modelInspection = inspectRequestedModel(requestedModel);
 
 	deps.setStoragePath(null);
@@ -325,7 +331,7 @@ export async function runReportCommand(
 	const storageHealth = await deps.inspectStorageHealth?.();
 	const now = deps.getNow?.() ?? Date.now();
 	const accountCount = storage?.accounts.length ?? 0;
-	const activeIndex = storage ? deps.resolveActiveIndex(storage, "codex") : 0;
+	const activeIndex = storage ? deps.resolveActiveIndex(storage, modelInspection.promptFamily) : 0;
 	const refreshFailures = new Map<number, TokenFailure>();
 	const liveQuotaByIndex = new Map<number, CodexQuotaSnapshot>();
 	const probeErrors: string[] = [];
@@ -456,7 +462,11 @@ export async function runReportCommand(
 					accountId: probeAccountId,
 					accessToken: probeAccessToken,
 					model: modelInspection.normalized,
+					fallbackModels: [],
 				});
+				if (liveQuota.model !== modelInspection.normalized) {
+					throw new Error(`Probe model mismatch: requested ${modelInspection.normalized}, received ${liveQuota.model}`);
+				}
 				liveQuotaByIndex.set(i, liveQuota);
 			} catch (error) {
 				const message = describeCodexProbeFailure(error, (raw) =>
@@ -467,15 +477,9 @@ export async function runReportCommand(
 		}
 	}
 
-	// Only an explicit --model moves the report off the codex family; see the
-	// note in the forecast command. promptFamily is reused from the inspection
-	// rather than re-resolved per account.
-	const forecastFamily = options.modelProvided
-		? modelInspection.promptFamily
-		: undefined;
-	const forecastModel = options.modelProvided
-		? modelInspection.normalized
-		: undefined;
+	// The default and an explicit request for that model share a routing bucket.
+	const forecastFamily = modelInspection.promptFamily;
+	const forecastModel = modelInspection.normalized;
 	const forecastResults = storage
 		? evaluateForecastAccounts(
 				storage.accounts.map((account, index) => ({
@@ -508,7 +512,7 @@ export async function runReportCommand(
 		: 0;
 	const rateLimitedCount = storage
 		? storage.accounts.filter(
-				(account) => !!deps.formatRateLimitEntry(account, now, "codex"),
+				(account) => !!deps.formatRateLimitEntry(account, now, modelInspection.promptFamily),
 			).length
 		: 0;
 

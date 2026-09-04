@@ -11,9 +11,23 @@ const { spawnSync } = require("node:child_process");
 const root = process.argv[2];
 const check = process.argv.includes("--check");
 if (!root || !path.isAbsolute(root)) throw new Error("absolute package root required");
-const marker = "codex-multi-auth r19: Astra and exact-model quota diagnostics";
+const marker = "codex-multi-auth r21: Astra defaults and exact-model quota diagnostics";
 const edits = [
   ["dist/lib/request/helpers/model-map.js", [
+    ['export const DEFAULT_MODEL = "gpt-5.5";', 'export const DEFAULT_MODEL = "gpt-6-astra";'],
+    ['export const DEFAULT_PROBE_MODEL = "gpt-5.6-sol";', 'export const DEFAULT_PROBE_MODEL = "gpt-6-astra";'],
+    ['        base: DEFAULT_MODEL,', '        base: GPT_5_5_CANONICAL_MODEL,'],
+    ['    base: DEFAULT_MODEL,', '    base: GPT_5_5_CANONICAL_MODEL,'],
+    ['addReasoningAliases("gpt-5", DEFAULT_MODEL);', 'addReasoningAliases("gpt-5", GPT_5_5_CANONICAL_MODEL);'],
+    ['addReasoningAliases("gpt-5-chat-latest", DEFAULT_MODEL);', 'addReasoningAliases("gpt-5-chat-latest", GPT_5_5_CANONICAL_MODEL);'],
+    [`export const QUOTA_PROBE_MODEL_CHAIN = [
+    DEFAULT_PROBE_MODEL,
+    DEFAULT_MODEL,
+    "gpt-5.4",
+    "gpt-5.3-codex",
+    "gpt-5.2-codex",
+    "gpt-5-codex",
+];`, 'export const QUOTA_PROBE_MODEL_CHAIN = [DEFAULT_PROBE_MODEL];'],
     ["export const MODEL_PROFILES = {", `export const MODEL_PROFILES = {
     // ${marker}
     "gpt-6-astra": {
@@ -25,7 +39,18 @@ const edits = [
     },`],
     ["addGpt56Aliases();", 'addGpt56Aliases();\naddEffortAliases("gpt-6-astra", "gpt-6-astra", ["low", "medium", "high", "xhigh", "max"]);'],
   ]],
+  ["dist/lib/codex-manager.js", [
+    ['import { CURRENT_CODEX_MODEL } from "./request/helpers/model-map.js";', `// ${marker}
+import { DEFAULT_MODEL, getModelProfile } from "./request/helpers/model-map.js";`],
+    ['getManagedAccountRuntimeSkipReason(runtimeAccount, "codex", CURRENT_CODEX_MODEL)', 'getManagedAccountRuntimeSkipReason(runtimeAccount, getModelProfile(DEFAULT_MODEL).promptFamily, DEFAULT_MODEL)'],
+    ['model: CURRENT_CODEX_MODEL,', 'model: DEFAULT_MODEL,'],
+  ]],
   ["dist/lib/codex-manager/commands/forecast.js", [
+    ['deps.resolveActiveIndex(storage, "codex")', 'deps.resolveActiveIndex(storage, getModelProfile(probeModel).promptFamily)'],
+    [`const forecastFamily = options.modelProvided
+        ? getModelProfile(requestedModel).promptFamily
+        : undefined;`, 'const forecastFamily = getModelProfile(probeModel).promptFamily;'],
+    ['const forecastModel = options.modelProvided ? probeModel : undefined;', 'const forecastModel = probeModel;'],
     ["DEFAULT_PROBE_MODEL, getModelProfile, resolveNormalizedModel,", "DEFAULT_PROBE_MODEL, getModelProfile, getNormalizedModel, resolveNormalizedModel,"],
     ["    const probeModel = resolveNormalizedModel(requestedModel);", `    // ${marker}
     if (options.modelProvided && !getNormalizedModel(requestedModel)) {
@@ -33,13 +58,35 @@ const edits = [
         return 1;
     }
     const probeModel = resolveNormalizedModel(requestedModel);`],
-    ["                model: probeModel,", "                model: probeModel,\n                ...(options.modelProvided ? { fallbackModels: [] } : {}),"],
-    ["            liveQuotaByIndex.set(i, liveQuota);", `            if (options.modelProvided && liveQuota.model !== probeModel) {
+    ["                model: probeModel,", "                model: probeModel,\n                fallbackModels: [],"],
+    ["            liveQuotaByIndex.set(i, liveQuota);", `            if (liveQuota.model !== probeModel) {
                 throw new Error(\`Probe model mismatch: requested \${probeModel}, received \${liveQuota.model}\`);
             }
             liveQuotaByIndex.set(i, liveQuota);`],
     ["            model: requestedModel,", "            model: requestedModel,\n            requestedModel,\n            probeModel,"],
     ["model ${requestedModel}, live check", 'model ${requestedModel}${requestedModel !== probeModel ? ` -> ${probeModel}` : ""}, live check'],
+  ]],
+  ["dist/lib/codex-manager/commands/report.js", [
+    ['deps.resolveActiveIndex(storage, "codex")', 'deps.resolveActiveIndex(storage, modelInspection.promptFamily)'],
+    ['deps.formatRateLimitEntry(account, now, "codex")', 'deps.formatRateLimitEntry(account, now, modelInspection.promptFamily)'],
+    ['DEFAULT_PROBE_MODEL, getModelCapabilities, getModelProfile, resolveNormalizedModel,', 'DEFAULT_PROBE_MODEL, getModelCapabilities, getModelProfile, getNormalizedModel, resolveNormalizedModel,'],
+    ['    const modelInspection = inspectRequestedModel(requestedModel);', `    if (options.modelProvided && !getNormalizedModel(requestedModel)) {
+        logError(\`Unknown probe model: \${requestedModel}; refusing model substitution\`);
+        return 1;
+    }
+    const modelInspection = inspectRequestedModel(requestedModel);`],
+    [`const forecastFamily = options.modelProvided
+        ? modelInspection.promptFamily
+        : undefined;`, `// ${marker}
+    const forecastFamily = modelInspection.promptFamily;`],
+    [`const forecastModel = options.modelProvided
+        ? modelInspection.normalized
+        : undefined;`, 'const forecastModel = modelInspection.normalized;'],
+    ['                    model: modelInspection.normalized,', '                    model: modelInspection.normalized,\n                    fallbackModels: [],'],
+    ['                liveQuotaByIndex.set(i, liveQuota);', `                if (liveQuota.model !== modelInspection.normalized) {
+                    throw new Error(\`Probe model mismatch: requested \${modelInspection.normalized}, received \${liveQuota.model}\`);
+                }
+                liveQuotaByIndex.set(i, liveQuota);`],
   ]],
   ["dist/lib/codex-manager/forecast-report-shared.js", [
     ["                    model: liveQuota.model,", `                    // ${marker}

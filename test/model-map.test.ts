@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
 	DEFAULT_MODEL,
+	DEFAULT_PROBE_MODEL,
+	QUOTA_PROBE_MODEL_CHAIN,
 	MODEL_MAP,
 	getModelCapabilities,
 	getModelProfile,
@@ -11,6 +13,17 @@ import {
 } from "../lib/request/helpers/model-map.js";
 
 describe("model map", () => {
+	it("defaults to exact Astra without rewriting legacy aliases or default-probe fallbacks", () => {
+		expect(DEFAULT_MODEL).toBe("gpt-6-astra");
+		expect(DEFAULT_PROBE_MODEL).toBe("gpt-6-astra");
+		expect(QUOTA_PROBE_MODEL_CHAIN).toEqual(["gpt-6-astra"]);
+		expect(resolveNormalizedModel(undefined)).toBe("gpt-6-astra");
+		for (const model of ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5", "gpt-5.4", "gpt-5.3-codex"]) {
+			expect(resolveNormalizedModel(model)).toBe(model);
+		}
+		expect(resolveNormalizedModel("gpt-5")).toBe("gpt-5.5");
+		expect(resolveNormalizedModel("gpt-5-chat-latest")).toBe("gpt-5.5");
+	});
 	it("preserves Astra and probes at a supported effort without borrowing 5.5 metadata", () => {
 		for (const alias of ["gpt-6-astra", "openai/gpt-6-astra", "gpt-6-astra-max"]) {
 			expect(resolveNormalizedModel(alias)).toBe("gpt-6-astra");

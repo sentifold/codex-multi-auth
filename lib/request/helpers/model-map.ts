@@ -100,29 +100,15 @@ const TOOL_CAPABILITIES = {
 } as const satisfies Record<string, ModelCapabilities>;
 
 export const CURRENT_CODEX_MODEL = "gpt-5.3-codex";
-export const DEFAULT_MODEL = "gpt-5.5";
+export const DEFAULT_MODEL = "gpt-6-astra";
 
 // Model used for diagnostic live/quota probes (`check`, `report`, `best`).
-// Deliberately distinct from DEFAULT_MODEL: GPT-5.6 is the latest general family
-// (issue #627), so the probe leads with it, while DEFAULT_MODEL stays on 5.5 so
-// actual request routing and the legacy `gpt-5` alias remain opt-in per 2.5.0.
-// Bare `gpt-5.6` aliases to Sol; we pin the canonical id so the probe display
-// and report `modelSelection` read `gpt-5.6-sol` without a remap arrow.
-export const DEFAULT_PROBE_MODEL = "gpt-5.6-sol";
+// Keep the canonical model exact; legacy aliases below do not follow defaults.
+export const DEFAULT_PROBE_MODEL = "gpt-6-astra";
 
-// Single source of truth for the live/quota probe fallback chain. Both the
-// manager probe (lib/quota-probe.ts) and the runtime probe (lib/runtime/quota-probe.ts)
-// import this so the ordered candidate list cannot drift between them. It leads
-// with GPT-5.6 and steps down so accounts without 5.6 entitlement still resolve
-// a working probe model.
-export const QUOTA_PROBE_MODEL_CHAIN = [
-	DEFAULT_PROBE_MODEL,
-	DEFAULT_MODEL,
-	"gpt-5.4",
-	"gpt-5.3-codex",
-	"gpt-5.2-codex",
-	"gpt-5-codex",
-] as const;
+// Both probe implementations share this policy: default diagnostics must never
+// report another model's quota as Astra's. Callers may supply explicit fallbacks.
+export const QUOTA_PROBE_MODEL_CHAIN = [DEFAULT_PROBE_MODEL] as const;
 
 const LEGACY_CODEX_MODEL = "gpt-5-codex";
 const GPT_6_ASTRA_EFFORTS = ["low", "medium", "high", "xhigh", "max"] as const;
@@ -177,7 +163,7 @@ const GENERAL_GPT5_VERSION_CATALOG: Record<
 		pro: "gpt-5.2-pro",
 	},
 	4: {
-		base: DEFAULT_MODEL,
+		base: GPT_5_5_CANONICAL_MODEL,
 		pro: "gpt-5.4-pro",
 		mini: "gpt-5.4-mini",
 		nano: "gpt-5.4-nano",
@@ -193,7 +179,7 @@ const GENERAL_GPT5_VERSION_CATALOG: Record<
 const GENERAL_GPT5_STABLE_VARIANTS = GENERAL_GPT5_VERSION_CATALOG[5];
 
 const GENERAL_GPT5_GENERIC_VARIANTS: Record<GeneralGpt5Variant, string> = {
-	base: DEFAULT_MODEL,
+	base: GPT_5_5_CANONICAL_MODEL,
 	pro: GPT_5_5_PRO_CANONICAL_MODEL,
 	mini: "gpt-5-mini",
 	nano: "gpt-5-nano",
@@ -397,12 +383,12 @@ function addGeneralAliases(): void {
 	addReasoningAliases("gpt-5-pro", GPT_5_5_PRO_CANONICAL_MODEL);
 	addReasoningAliases("gpt-5.2", "gpt-5.2");
 	addReasoningAliases("gpt-5.1", "gpt-5.1");
-	addReasoningAliases("gpt-5", DEFAULT_MODEL);
+	addReasoningAliases("gpt-5", GPT_5_5_CANONICAL_MODEL);
 	addReasoningAliases("gpt-5-mini", "gpt-5-mini");
 	addReasoningAliases("gpt-5-nano", "gpt-5-nano");
 
 	addReasoningAliases("gpt-5.1-chat-latest", "gpt-5.1");
-	addReasoningAliases("gpt-5-chat-latest", DEFAULT_MODEL);
+	addReasoningAliases("gpt-5-chat-latest", GPT_5_5_CANONICAL_MODEL);
 }
 
 function addCodexAliases(): void {

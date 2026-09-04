@@ -2,7 +2,6 @@ import { describe, expect, it, vi } from "vitest";
 
 import { fetchRuntimeCodexQuotaSnapshot } from "../lib/runtime/quota-probe.js";
 import {
-	DEFAULT_MODEL,
 	DEFAULT_PROBE_MODEL,
 } from "../lib/request/helpers/model-map.js";
 
@@ -51,7 +50,7 @@ describe("fetchRuntimeCodexQuotaSnapshot", () => {
 		expect(parseCodexQuotaSnapshot).toHaveBeenCalledOnce();
 	});
 
-	it("falls back to the next model when the first one is unsupported", async () => {
+	it("does not downgrade default Astra when it is unsupported", async () => {
 		const fetchImpl = vi
 			.fn()
 			.mockResolvedValueOnce(
@@ -67,7 +66,7 @@ describe("fetchRuntimeCodexQuotaSnapshot", () => {
 				new Response("", { status: 200, headers: makeQuotaHeaders() }),
 			);
 
-		const snapshot = await fetchRuntimeCodexQuotaSnapshot({
+		await expect(fetchRuntimeCodexQuotaSnapshot({
 			accountId: "acc-1",
 			accessToken: "token-1",
 			baseUrl: "https://example.test",
@@ -92,9 +91,8 @@ describe("fetchRuntimeCodexQuotaSnapshot", () => {
 				isUnsupported: true,
 				message: "unsupported",
 			}),
-		});
+		})).rejects.toThrow();
 
-		expect(snapshot.model).toBe(DEFAULT_MODEL);
-		expect(fetchImpl).toHaveBeenCalledTimes(2);
+		expect(fetchImpl).toHaveBeenCalledTimes(1);
 	});
 });

@@ -46,9 +46,9 @@ function createDeps(
 			expires: 100,
 			idToken: "id-token-1",
 		})),
-		fetchCodexQuotaSnapshot: vi.fn(async () => ({
+		fetchCodexQuotaSnapshot: vi.fn(async (input) => ({
 			status: 200,
-			model: "gpt-5.3-codex",
+			model: input.model ?? DEFAULT_PROBE_MODEL,
 			primary: {},
 			secondary: {},
 		})),
@@ -73,6 +73,38 @@ function createDeps(
 }
 
 describe("runReportCommand", () => {
+	it.each([[], ["--model", "gpt-6-astra"]])("uses the Astra family's active account and summary (%j)", async (...modelArgs: string[]) => {
+		const storage = createStorage();
+		storage.accounts.push({ ...storage.accounts[0]!, email: "second@example.com" });
+		storage.activeIndexByFamily = { codex: 0, "gpt-5.2": 1 };
+		const deps = createDeps({
+			loadAccounts: vi.fn(async () => storage),
+			resolveActiveIndex: vi.fn((state, family) => state.activeIndexByFamily?.[family ?? "codex"] ?? state.activeIndex),
+		});
+		expect(await runReportCommand(["--json", ...modelArgs], deps)).toBe(0);
+		expect(deps.resolveActiveIndex).toHaveBeenCalledWith(storage, "gpt-5.2");
+		expect(deps.formatRateLimitEntry).toHaveBeenCalledWith(storage.accounts[0], 1_000, "gpt-5.2");
+		const report = JSON.parse(String(vi.mocked(deps.logInfo!).mock.calls.at(-1)?.[0]));
+		expect(report.forecast.accounts.map((account: {isCurrent: boolean}) => account.isCurrent)).toEqual([false, true]);
+	});
+	it("rejects unknown explicit models before account access", async () => {
+		const deps = createDeps();
+		expect(await runReportCommand(["--live", "--model", "gpt-7-unknown"], deps)).toBe(1);
+		expect(deps.loadAccounts).not.toHaveBeenCalled();
+		expect(deps.fetchCodexQuotaSnapshot).not.toHaveBeenCalled();
+	});
+	it.each([[], ["--model", "gpt-6-astra"]])("rejects wrong-model quota snapshots for default or explicit Astra (%j)", async (...modelArgs: string[]) => {
+		const deps = createDeps({
+			loadAccounts: vi.fn(async () => createStorage([{ ...createStorage().accounts[0]!, accountId: "acct-probe" }])),
+			hasUsableAccessToken: vi.fn(() => true),
+			fetchCodexQuotaSnapshot: vi.fn(async () => ({ status: 200, model: "gpt-5.5", primary: {}, secondary: {} })),
+		});
+		expect(await runReportCommand(["--live", "--json", ...modelArgs], deps)).toBe(0);
+		const report = JSON.parse(String(vi.mocked(deps.logInfo!).mock.calls.at(-1)?.[0]));
+		expect(report.forecast.probeErrors[0]).toContain("Probe model mismatch");
+		expect(report.forecast.accounts[0].liveQuota).toBeUndefined();
+		expect(deps.fetchCodexQuotaSnapshot).toHaveBeenCalledWith(expect.objectContaining({ model: "gpt-6-astra", fallbackModels: [] }));
+	});
 	it("prints usage for help", async () => {
 		const deps = createDeps();
 
@@ -144,7 +176,7 @@ describe("runReportCommand", () => {
 		expect(codex.accounts[0]?.availability).toBe("ready");
 	});
 
-	it("keeps a bare report on the codex family", async () => {
+	it("keeps implicit and explicit Astra reports on the same model-family bucket", async () => {
 		const storage = createStorage([
 			{
 				email: "one@example.com",
@@ -154,14 +186,12 @@ describe("runReportCommand", () => {
 				addedAt: 1,
 				lastUsed: 1,
 				enabled: true,
-				rateLimitResetTimes: { codex: 31_000 },
+				rateLimitResetTimes: { "gpt-5.2:gpt-6-astra": 31_000 },
 			},
 		]);
 		const deps = createDeps({ loadAccounts: vi.fn(async () => storage) });
 
-		// DEFAULT_PROBE_MODEL is gpt-5.6-sol, whose family is gpt-5.2. Keying the
-		// no-flag invocation on it would report this account ready while every
-		// /codex/responses request 503s off the very same record.
+		// The exact model's runtime record gates implicit defaults too.
 		await expect(runReportCommand(["--json"], deps)).resolves.toBe(0);
 		const forecast = (
 			JSON.parse(
@@ -181,6 +211,9 @@ describe("runReportCommand", () => {
 				reason.startsWith("rate limit resets in"),
 			),
 		).toBe(true);
+		await expect(runReportCommand(["--json", "--model", "gpt-6-astra"], deps)).resolves.toBe(0);
+		const explicit = JSON.parse(String(vi.mocked(deps.logInfo!).mock.calls.at(-1)?.[0]));
+		expect(explicit.forecast.accounts).toEqual(forecast.accounts);
 	});
 
 	it("does not gate the forecast on a sibling model's record in the same family", async () => {
@@ -607,13 +640,13 @@ describe("runReportCommand", () => {
 					idToken: `id-${refreshToken}`,
 				};
 			}),
-			fetchCodexQuotaSnapshot: vi.fn(async ({ accountId }) => {
+			fetchCodexQuotaSnapshot: vi.fn(async ({ accountId, model }) => {
 				if (accountId === "acct-probe-error") {
 					throw new Error("quota endpoint down");
 				}
 				return {
 					status: 200,
-					model: "gpt-5-codex",
+					model: model ?? DEFAULT_PROBE_MODEL,
 					planType: "pro",
 					primary: {},
 					secondary: {},
@@ -676,6 +709,7 @@ describe("runReportCommand", () => {
 			accountId: "acct-live",
 			accessToken: "access-token-1",
 			model: DEFAULT_PROBE_MODEL,
+			fallbackModels: [],
 		});
 	});
 

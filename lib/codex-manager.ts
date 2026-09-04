@@ -67,7 +67,7 @@ import {
 	evaluateRuntimePolicy,
 	loadRuntimePolicyState,
 } from "./policy/runtime-policy.js";
-import { CURRENT_CODEX_MODEL } from "./request/helpers/model-map.js";
+import { DEFAULT_MODEL, getModelProfile } from "./request/helpers/model-map.js";
 import {
 	runDoctor as runRepairDoctor,
 	type RepairCommandDeps,
@@ -414,8 +414,8 @@ export function buildSelectAccountTraced(): (
 				const runtimeSkipReason = runtimeAccount
 					? runtimeAccountManager.getManagedAccountRuntimeSkipReason(
 							runtimeAccount,
-							"codex",
-							CURRENT_CODEX_MODEL,
+							getModelProfile(DEFAULT_MODEL).promptFamily,
+							DEFAULT_MODEL,
 						)
 					: "missing";
 				return {
@@ -435,7 +435,7 @@ export function buildSelectAccountTraced(): (
 				accountId: account.accountId,
 				email: account.email,
 			})),
-			model: CURRENT_CODEX_MODEL,
+			model: DEFAULT_MODEL,
 			now,
 		});
 		const blockedAccountIndexes = new Set(policy.blockedAccountIndexes);

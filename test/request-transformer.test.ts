@@ -46,11 +46,11 @@ describe('Request Transformer Module', () => {
 			expect(normalizeModel('gpt-5-nano')).toBe('gpt-5-nano');
 		});
 
-		it('defaults unknown requests to GPT-5.5 instead of GPT-5.1', async () => {
-			expect(normalizeModel('unknown-model')).toBe('gpt-5.5');
-			expect(normalizeModel('gpt-4')).toBe('gpt-5.5');
-			expect(normalizeModel(undefined)).toBe('gpt-5.5');
-			expect(normalizeModel('')).toBe('gpt-5.5');
+		it('defaults unknown requests to GPT-6 Astra', async () => {
+			expect(normalizeModel('unknown-model')).toBe('gpt-6-astra');
+			expect(normalizeModel('gpt-4')).toBe('gpt-6-astra');
+			expect(normalizeModel(undefined)).toBe('gpt-6-astra');
+			expect(normalizeModel('')).toBe('gpt-6-astra');
 		});
 
 		it('keeps GPT-5.5 aliases canonical before any unsupported-model fallback happens', async () => {
@@ -2873,6 +2873,4 @@ describe('Request Transformer Module', () => {
 		});
 	});
 });
-
-
 

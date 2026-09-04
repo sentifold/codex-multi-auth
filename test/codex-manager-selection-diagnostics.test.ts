@@ -56,7 +56,7 @@ function createStorage(now: number): AccountStorageV3 {
 				addedAt: now,
 				lastUsed: now,
 				rateLimitResetTimes: {
-					"codex:gpt-5.3-codex": now + 60_000,
+					"gpt-5.2:gpt-6-astra": now + 60_000,
 				},
 			},
 			{

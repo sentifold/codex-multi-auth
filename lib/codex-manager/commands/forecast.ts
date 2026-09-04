@@ -29,10 +29,7 @@ interface ForecastCliOptions {
 	json: boolean;
 	explain: boolean;
 	model: string;
-	/**
-	 * Whether --model was actually passed. The default probe model is not a
-	 * codex-family model, so its family must NOT govern a bare invocation.
-	 */
+	/** Whether --model was passed, for strict unknown-model validation. */
 	modelProvided: boolean;
 	runtimeOverlay: boolean;
 }
@@ -52,7 +49,7 @@ export interface ForecastCommandDeps {
 	loadAccounts: () => Promise<AccountStorageV3 | null>;
 	saveAccounts: (storage: AccountStorageV3) => Promise<void>;
 	loadDashboardDisplaySettings?: () => Promise<DashboardDisplaySettings>;
-	resolveActiveIndex: (storage: AccountStorageV3, family?: "codex") => number;
+	resolveActiveIndex: (storage: AccountStorageV3, family?: ModelFamily) => number;
 	loadQuotaCache: () => Promise<QuotaCacheData | null>;
 	saveQuotaCache: (cache: QuotaCacheData) => Promise<void>;
 	cloneQuotaCacheData: (cache: QuotaCacheData) => QuotaCacheData;
@@ -264,7 +261,7 @@ export async function runForecastCommand(
 			: null;
 
 	const now = deps.getNow?.() ?? Date.now();
-	const activeIndex = deps.resolveActiveIndex(storage, "codex");
+	const activeIndex = deps.resolveActiveIndex(storage, getModelProfile(probeModel).promptFamily);
 	const refreshFailures = new Map<number, TokenFailure>();
 	const liveQuotaByIndex = new Map<number, CodexQuotaSnapshot>();
 	const probeErrors: string[] = [];
@@ -356,9 +353,9 @@ export async function runForecastCommand(
 				accountId: probeAccountId,
 				accessToken: probeAccessToken,
 				model: probeModel,
-				...(options.modelProvided ? { fallbackModels: [] } : {}),
+				fallbackModels: [],
 			});
-			if (options.modelProvided && liveQuota.model !== probeModel) {
+			if (liveQuota.model !== probeModel) {
 				throw new Error(`Probe model mismatch: requested ${probeModel}, received ${liveQuota.model}`);
 			}
 			liveQuotaByIndex.set(i, liveQuota);
@@ -383,18 +380,10 @@ export async function runForecastCommand(
 		}
 	}
 
-	// Only an explicit --model moves the forecast off the codex family. The
-	// default probe model is gpt-5.6-sol, whose family is gpt-5.2, so keying a
-	// bare `forecast` on it would evaluate every account against a family no
-	// wrapper request uses - /codex/responses buckets into codex.
-	//
-	// probeModel, not requestedModel: rate-limit records are keyed by the
-	// normalized model the proxy routes on. Resolved once rather than per
-	// account: getModelProfile re-parses the model string on every call.
-	const forecastFamily = options.modelProvided
-		? getModelProfile(requestedModel).promptFamily
-		: undefined;
-	const forecastModel = options.modelProvided ? probeModel : undefined;
+	// Implicit and explicit model selection must inspect the same routing bucket.
+	// A model-less legacy request is not representative of default Astra traffic.
+	const forecastFamily = getModelProfile(probeModel).promptFamily;
+	const forecastModel = probeModel;
 	const forecastInputs = storage.accounts.map((account, index) => ({
 		index,
 		account,

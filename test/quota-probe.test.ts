@@ -31,7 +31,6 @@ import {
 } from "../lib/quota-probe.js";
 import { CodexUnavailableError } from "../lib/errors.js";
 import {
-	DEFAULT_MODEL,
 	DEFAULT_PROBE_MODEL,
 } from "../lib/request/helpers/model-map.js";
 
@@ -88,7 +87,7 @@ describe("quota-probe", () => {
 		expect(fetchMock).toHaveBeenCalledTimes(1);
 	});
 
-	it("uses gpt-5.6-sol as the default quota probe model", async () => {
+	it("uses exact gpt-6-astra as the default quota probe model", async () => {
 		const fetchMock = vi.fn(async () =>
 			new Response("", { status: 200, headers: makeQuotaHeaders() }),
 		);
@@ -104,10 +103,7 @@ describe("quota-probe", () => {
 		expect(fetchMock).toHaveBeenCalledTimes(1);
 	});
 
-	it("falls back from the GPT-5.6 probe model to gpt-5.5 when it is unsupported", async () => {
-		// The default probe chain leads with DEFAULT_PROBE_MODEL (GPT-5.6); if the
-		// account cannot use it, the next candidate (DEFAULT_MODEL / gpt-5.5) must
-		// be tried before any codex model.
+	it("does not downgrade the default Astra probe when it is unsupported", async () => {
 		const unsupported = new Response(
 			JSON.stringify({
 				error: {
@@ -136,15 +132,13 @@ describe("quota-probe", () => {
 				message: undefined,
 			});
 
-		const snapshot = await fetchCodexQuotaSnapshot({
+		await expect(fetchCodexQuotaSnapshot({
 			accountId: "acc-1",
 			accessToken: "token-1",
-		});
+		})).rejects.toThrow();
 
-		expect(snapshot.model).toBe(DEFAULT_MODEL);
-		expect(fetchMock).toHaveBeenCalledTimes(2);
+		expect(fetchMock).toHaveBeenCalledTimes(1);
 		expect(getCodexInstructionsMock).toHaveBeenNthCalledWith(1, DEFAULT_PROBE_MODEL);
-		expect(getCodexInstructionsMock).toHaveBeenNthCalledWith(2, DEFAULT_MODEL);
 	});
 
 	it("falls back to next model when first model is unsupported", async () => {

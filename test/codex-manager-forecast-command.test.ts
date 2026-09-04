@@ -57,9 +57,9 @@ function createDeps(
 			refresh: "refresh-forecast",
 			expires: Date.now() + 60_000,
 		})),
-		fetchCodexQuotaSnapshot: vi.fn(async () => ({
+		fetchCodexQuotaSnapshot: vi.fn(async (input) => ({
 			status: 200,
-			model: "gpt-5-codex",
+			model: input.model ?? DEFAULT_PROBE_MODEL,
 			primary: {},
 			secondary: {},
 		})),
@@ -123,7 +123,20 @@ function createDeps(
 }
 
 describe("runForecastCommand", () => {
-	it("probes explicit Astra without fallback and reports the actual model and windows", async () => {
+	it.each([[], ["--model", "gpt-6-astra"]])("uses the Astra family's active account (%j)", async (...modelArgs: string[]) => {
+		const storage = createStorage();
+		storage.accounts.push({ ...storage.accounts[0]!, email: "second@example.com" });
+		storage.activeIndexByFamily = { codex: 0, "gpt-5.2": 1 };
+		const deps = createDeps({
+			loadAccounts: vi.fn(async () => storage),
+			resolveActiveIndex: vi.fn((state, family) => state.activeIndexByFamily?.[family ?? "codex"] ?? state.activeIndex),
+		});
+		expect(await runForecastCommand(["--json", ...modelArgs], deps)).toBe(0);
+		expect(deps.resolveActiveIndex).toHaveBeenCalledWith(storage, "gpt-5.2");
+		const inputs = vi.mocked(deps.evaluateForecastAccounts).mock.calls[0]?.[0];
+		expect(inputs?.map((input) => input.isCurrent)).toEqual([false, true]);
+	});
+	it.each([[], ["--model", "gpt-6-astra"]])("probes default or explicit Astra without fallback (%j)", async (...modelArgs: string[]) => {
 		const deps = createDeps({
 			fetchCodexQuotaSnapshot: vi.fn(async () => ({
 				status: 200, model: "gpt-6-astra",
@@ -131,7 +144,7 @@ describe("runForecastCommand", () => {
 				secondary: { usedPercent: 22, windowMinutes: 10080 },
 			})),
 		});
-		expect(await runForecastCommand(["--live", "--json", "--model", "gpt-6-astra"], deps)).toBe(0);
+		expect(await runForecastCommand(["--live", "--json", ...modelArgs], deps)).toBe(0);
 		expect(deps.fetchCodexQuotaSnapshot).toHaveBeenCalledWith(expect.objectContaining({ model: "gpt-6-astra", fallbackModels: [] }));
 		const report = JSON.parse(vi.mocked(deps.logInfo!).mock.calls[0][0]);
 		expect(report).toMatchObject({ requestedModel: "gpt-6-astra", probeModel: "gpt-6-astra", probeErrors: [] });
@@ -146,9 +159,9 @@ describe("runForecastCommand", () => {
 		expect(deps.logError).toHaveBeenCalledWith(expect.stringContaining("refusing model substitution"));
 	});
 
-	it("does not cache or report a successful probe of a different model", async () => {
-		const deps = createDeps();
-		expect(await runForecastCommand(["--live", "--json", "--model", "gpt-6-astra"], deps)).toBe(0);
+	it.each([[], ["--model", "gpt-6-astra"]])("does not cache or report a successful probe of a different model (%j)", async (...modelArgs: string[]) => {
+		const deps = createDeps({ fetchCodexQuotaSnapshot: vi.fn(async () => ({ status: 200, model: "gpt-5.5", primary: {}, secondary: {} })) });
+		expect(await runForecastCommand(["--live", "--json", ...modelArgs], deps)).toBe(0);
 		const report = JSON.parse(vi.mocked(deps.logInfo!).mock.calls[0][0]);
 		expect(report.probeErrors[0]).toContain("Probe model mismatch");
 		expect(report.accounts[0].liveQuota).toBeUndefined();
@@ -239,12 +252,10 @@ describe("runForecastCommand", () => {
 		const defaulted = evaluateForecastAccounts.mock.calls.at(-1)?.[0] as
 			| Array<{ family?: string; model?: string | null }>
 			| undefined;
-		// DEFAULT_PROBE_MODEL is gpt-5.6-sol, family gpt-5.2 - NOT codex. A bare
-		// `forecast` must leave family and model unset so evaluation keeps the
-		// codex default, matching the family /codex/responses buckets into.
+		// Bare forecasts inspect the same bucket as default Astra requests.
 		expect(getModelProfile(DEFAULT_PROBE_MODEL).promptFamily).not.toBe("codex");
-		expect(defaulted?.[0]?.family).toBeUndefined();
-		expect(defaulted?.[0]?.model).toBeUndefined();
+		expect(defaulted?.[0]?.family).toBe(getModelProfile(DEFAULT_PROBE_MODEL).promptFamily);
+		expect(defaulted?.[0]?.model).toBe(DEFAULT_PROBE_MODEL);
 	});
 
 	it("honors --no-runtime-overlay in json forecast output", async () => {
@@ -411,7 +422,7 @@ describe("runForecastCommand", () => {
 			formatQuotaSnapshotLine: vi.fn(() => "slow quota"),
 			fetchCodexQuotaSnapshot: vi.fn(async () => ({
 				status: 200,
-				model: "gpt-5-codex",
+				model: DEFAULT_PROBE_MODEL,
 				primary: {},
 				secondary: {},
 			})),
@@ -420,7 +431,7 @@ describe("runForecastCommand", () => {
 			formatQuotaSnapshotLine: vi.fn(() => "fast quota"),
 			fetchCodexQuotaSnapshot: vi.fn(async () => ({
 				status: 200,
-				model: "gpt-5-codex",
+				model: DEFAULT_PROBE_MODEL,
 				primary: {},
 				secondary: {},
 			})),
