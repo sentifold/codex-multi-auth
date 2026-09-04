@@ -14,6 +14,14 @@ what is running in production.
 
 ## What it changes
 
+- **Astra-aware quota diagnostics.** `gpt-6-astra` stays exact and probes use
+  `low`, matching the [official reasoning range](https://developers.openai.com/api/docs/models/gpt-6-astra).
+  An explicit forecast model disables fallback; unknown models or a mismatched
+  probe response are rejected. JSON includes `requestedModel`, `probeModel`,
+  and the actual per-account `liveQuota.model`, `primary`, and `secondary`
+  windows so a UI never has to race against the shared quota cache. The default
+  request model and the default generic probe model remain unchanged.
+
 - **Client identity preserved.** The proxy no longer overwrites `originator`
   and `OpenAI-Beta` with the legacy `codex_cli_rs` / `responses=experimental`
   pair. Entitlement for newer model tiers is keyed to the client identity that
@@ -95,6 +103,9 @@ deliberately, install the new pinned version and re-run this patch.
   the payloads, validates the result.
 - `payloads/codex-runtime.cjs` — runtime proxy and session-affinity patch.
 - `payloads/codex-wrapper.cjs` — `scripts/codex.js` patch.
+- `payloads/codex-model-catalog.cjs` — staged Astra/forecast backport for 2.9.1;
+  accepts an absolute package root and optional `--check`. Managed installers
+  apply this to a new immutable release before publishing its pointer.
 - `payloads/check-*.cjs` — the verification payloads `--check` runs. Validation
   deliberately reuses these rather than a re-stated list of markers, because a
   hand-maintained copy drifts from what the patch actually writes.

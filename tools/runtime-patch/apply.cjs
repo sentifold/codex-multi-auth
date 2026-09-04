@@ -138,7 +138,8 @@ function main() {
 	}
 
 	if (checkOnly) {
-		process.exit(verify(targets, { quiet: false }) ? 0 : 1);
+		const catalog = spawnSync(process.execPath, [path.join(__dirname, "payloads/codex-model-catalog.cjs"), packageRoot, "--check"], { stdio: "inherit" });
+		process.exit(verify(targets, { quiet: false }) && catalog.status === 0 ? 0 : 1);
 	}
 
 	const runtime = runPayload("codex-runtime.cjs", targets);
@@ -149,6 +150,8 @@ function main() {
 	if (wrapper.status !== 0) {
 		fail("the wrapper patch aborted; the package was left partially patched");
 	}
+	const catalog = spawnSync(process.execPath, [path.join(__dirname, "payloads/codex-model-catalog.cjs"), packageRoot], { stdio: "inherit" });
+	if (catalog.status !== 0) fail("the model catalog patch aborted");
 
 	for (const filePath of Object.values(targets)) {
 		const checked = spawnSync(process.execPath, ["--check", filePath], { encoding: "utf8" });

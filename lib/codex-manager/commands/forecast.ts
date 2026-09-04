@@ -16,6 +16,7 @@ import type { QuotaCacheData } from "../../quota-cache.js";
 import { type CodexQuotaSnapshot, describeCodexProbeFailure } from "../../quota-probe.js";
 import {
 	DEFAULT_PROBE_MODEL,
+	getNormalizedModel,
 	getModelProfile,
 	type ModelFamily,
 	resolveNormalizedModel,
@@ -74,6 +75,7 @@ export interface ForecastCommandDeps {
 		accountId: string;
 		accessToken: string;
 		model: string;
+		fallbackModels?: readonly string[];
 	}) => Promise<CodexQuotaSnapshot>;
 	normalizeFailureDetail: (
 		message: string | undefined,
@@ -231,6 +233,10 @@ export async function runForecastCommand(
 	}
 	const options = parsedArgs.options;
 	const requestedModel = options.model?.trim() || DEFAULT_PROBE_MODEL;
+	if (options.modelProvided && !getNormalizedModel(requestedModel)) {
+		logError(`Unknown probe model: ${requestedModel}; refusing model substitution`);
+		return 1;
+	}
 	const probeModel = resolveNormalizedModel(requestedModel);
 	const display = deps.loadDashboardDisplaySettings
 		? (await deps.loadDashboardDisplaySettings().catch(() => null)) ??
@@ -350,7 +356,11 @@ export async function runForecastCommand(
 				accountId: probeAccountId,
 				accessToken: probeAccessToken,
 				model: probeModel,
+				...(options.modelProvided ? { fallbackModels: [] } : {}),
 			});
+			if (options.modelProvided && liveQuota.model !== probeModel) {
+				throw new Error(`Probe model mismatch: requested ${probeModel}, received ${liveQuota.model}`);
+			}
 			liveQuotaByIndex.set(i, liveQuota);
 			if (workingQuotaCache) {
 				const nextAccount = storage.accounts[i];
@@ -423,6 +433,8 @@ export async function runForecastCommand(
 				{
 					command: "forecast",
 					model: requestedModel,
+					requestedModel,
+					probeModel,
 					liveProbe: options.live,
 					runtimeOverlay: options.runtimeOverlay,
 					summary,
@@ -445,7 +457,7 @@ export async function runForecastCommand(
 
 	logInfo(
 		deps.stylePromptText(
-			`Best-account preview (${storage.accounts.length} account(s), model ${requestedModel}, live check ${options.live ? "on" : "off"})`,
+			`Best-account preview (${storage.accounts.length} account(s), model ${requestedModel}${requestedModel !== probeModel ? ` -> ${probeModel}` : ""}, live check ${options.live ? "on" : "off"})`,
 			"accent",
 		),
 	);

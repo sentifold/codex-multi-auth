@@ -89,6 +89,8 @@ export function serializeForecastResults(
 		planType?: string;
 		activeLimit?: number;
 		model: string;
+		primary: CodexQuotaSnapshot["primary"];
+		secondary: CodexQuotaSnapshot["secondary"];
 		summary: string;
 	};
 	refreshFailure?: TokenFailure;
@@ -112,6 +114,8 @@ export function serializeForecastResults(
 						planType: liveQuota.planType,
 						activeLimit: liveQuota.activeLimit,
 						model: liveQuota.model,
+						primary: { ...liveQuota.primary },
+						secondary: { ...liveQuota.secondary },
 						summary: formatQuotaSnapshotLine(liveQuota),
 				  }
 				: undefined,

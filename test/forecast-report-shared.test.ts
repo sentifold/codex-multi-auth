@@ -311,6 +311,8 @@ describe("serializeForecastResults", () => {
 				activeLimit: 100,
 				model: "gpt-5-codex",
 				summary: "summary:gpt-5-codex",
+				primary: snapshot.primary,
+				secondary: snapshot.secondary,
 			},
 		});
 		expect(rows[0].refreshFailure).toBeUndefined();

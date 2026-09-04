@@ -123,6 +123,37 @@ function createDeps(
 }
 
 describe("runForecastCommand", () => {
+	it("probes explicit Astra without fallback and reports the actual model and windows", async () => {
+		const deps = createDeps({
+			fetchCodexQuotaSnapshot: vi.fn(async () => ({
+				status: 200, model: "gpt-6-astra",
+				primary: { usedPercent: 11, windowMinutes: 300 },
+				secondary: { usedPercent: 22, windowMinutes: 10080 },
+			})),
+		});
+		expect(await runForecastCommand(["--live", "--json", "--model", "gpt-6-astra"], deps)).toBe(0);
+		expect(deps.fetchCodexQuotaSnapshot).toHaveBeenCalledWith(expect.objectContaining({ model: "gpt-6-astra", fallbackModels: [] }));
+		const report = JSON.parse(vi.mocked(deps.logInfo!).mock.calls[0][0]);
+		expect(report).toMatchObject({ requestedModel: "gpt-6-astra", probeModel: "gpt-6-astra", probeErrors: [] });
+		expect(report.accounts[0].liveQuota).toMatchObject({ model: "gpt-6-astra", primary: { usedPercent: 11 }, secondary: { usedPercent: 22 } });
+	});
+
+	it("refuses an unknown explicit model before probing or reading account state", async () => {
+		const deps = createDeps();
+		expect(await runForecastCommand(["--live", "--model", "gpt-7-missing"], deps)).toBe(1);
+		expect(deps.fetchCodexQuotaSnapshot).not.toHaveBeenCalled();
+		expect(deps.loadAccounts).not.toHaveBeenCalled();
+		expect(deps.logError).toHaveBeenCalledWith(expect.stringContaining("refusing model substitution"));
+	});
+
+	it("does not cache or report a successful probe of a different model", async () => {
+		const deps = createDeps();
+		expect(await runForecastCommand(["--live", "--json", "--model", "gpt-6-astra"], deps)).toBe(0);
+		const report = JSON.parse(vi.mocked(deps.logInfo!).mock.calls[0][0]);
+		expect(report.probeErrors[0]).toContain("Probe model mismatch");
+		expect(report.accounts[0].liveQuota).toBeUndefined();
+		expect(deps.updateQuotaCacheForAccount).not.toHaveBeenCalled();
+	});
 	it("prints usage for help", async () => {
 		const deps = createDeps();
 		const result = await runForecastCommand(["--help"], deps);

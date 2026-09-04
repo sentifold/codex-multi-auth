@@ -7,9 +7,21 @@ import {
 	getNormalizedModel,
 	isKnownModel,
 	resolveNormalizedModel,
+	resolveProbeReasoningEffort,
 } from "../lib/request/helpers/model-map.js";
 
 describe("model map", () => {
+	it("preserves Astra and probes at a supported effort without borrowing 5.5 metadata", () => {
+		for (const alias of ["gpt-6-astra", "openai/gpt-6-astra", "gpt-6-astra-max"]) {
+			expect(resolveNormalizedModel(alias)).toBe("gpt-6-astra");
+			expect(resolveProbeReasoningEffort(alias)).toBe("low");
+		}
+		expect(getModelProfile("gpt-6-astra").supportedReasoningEfforts).toEqual([
+			"low", "medium", "high", "xhigh", "max",
+		]);
+		expect(isKnownModel("gpt-6-astra-none")).toBe(false);
+		expect(isKnownModel("gpt-6-astra-minimal")).toBe(false);
+	});
 	describe("MODEL_MAP", () => {
 		it("routes Codex aliases to the current documented Codex model", () => {
 			expect(MODEL_MAP["gpt-5-codex"]).toBe("gpt-5.3-codex");

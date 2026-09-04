@@ -125,6 +125,7 @@ export const QUOTA_PROBE_MODEL_CHAIN = [
 ] as const;
 
 const LEGACY_CODEX_MODEL = "gpt-5-codex";
+const GPT_6_ASTRA_EFFORTS = ["low", "medium", "high", "xhigh", "max"] as const;
 
 /**
  * GPT-5.6 tiers, per the upstream Codex catalog
@@ -207,6 +208,13 @@ const GENERAL_GPT5_GENERIC_VARIANTS: Record<GeneralGpt5Variant, string> = {
  * present in the latest upstream release.
  */
 export const MODEL_PROFILES: Record<string, ModelProfile> = {
+	"gpt-6-astra": {
+		normalizedModel: "gpt-6-astra",
+		promptFamily: "gpt-5.2",
+		defaultReasoningEffort: "low",
+		supportedReasoningEfforts: GPT_6_ASTRA_EFFORTS,
+		capabilities: TOOL_CAPABILITIES.full,
+	},
 	[CURRENT_CODEX_MODEL]: {
 		normalizedModel: CURRENT_CODEX_MODEL,
 		promptFamily: "gpt-5-codex",
@@ -417,6 +425,7 @@ function addCodexAliases(): void {
 addCodexAliases();
 addGeneralAliases();
 addGpt56Aliases();
+addEffortAliases("gpt-6-astra", "gpt-6-astra", GPT_6_ASTRA_EFFORTS);
 
 export { MODEL_MAP };
 
