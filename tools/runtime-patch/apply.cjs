@@ -71,6 +71,7 @@ function resolvePackageRoot() {
 function targetsFor(packageRoot) {
 	return {
 		ROUTER_CODEX_PROXY_FILE: path.join(packageRoot, "dist/lib/runtime-rotation-proxy.js"),
+		ROUTER_CODEX_ACCOUNTS_FILE: path.join(packageRoot, "dist/lib/accounts.js"),
 		ROUTER_CODEX_SESSION_AFFINITY_FILE: path.join(packageRoot, "dist/lib/session-affinity.js"),
 		ROUTER_CODEX_WRAPPER_FILE: path.join(packageRoot, "scripts/codex.js"),
 	};
@@ -139,7 +140,8 @@ function main() {
 
 	if (checkOnly) {
 		const catalog = spawnSync(process.execPath, [path.join(__dirname, "payloads/codex-model-catalog.cjs"), packageRoot, "--check"], { stdio: "inherit" });
-		process.exit(verify(targets, { quiet: false }) && catalog.status === 0 ? 0 : 1);
+		const quotaScope = spawnSync(process.execPath, [path.join(__dirname, "payloads/codex-quota-scope.cjs"), packageRoot, "--check"], { stdio: "inherit" });
+		process.exit(verify(targets, { quiet: false }) && catalog.status === 0 && quotaScope.status === 0 ? 0 : 1);
 	}
 
 	const runtime = runPayload("codex-runtime.cjs", targets);
@@ -152,6 +154,8 @@ function main() {
 	}
 	const catalog = spawnSync(process.execPath, [path.join(__dirname, "payloads/codex-model-catalog.cjs"), packageRoot], { stdio: "inherit" });
 	if (catalog.status !== 0) fail("the model catalog patch aborted");
+	const quotaScope = spawnSync(process.execPath, [path.join(__dirname, "payloads/codex-quota-scope.cjs"), packageRoot], { stdio: "inherit" });
+	if (quotaScope.status !== 0) fail("the quota scope patch aborted");
 
 	for (const filePath of Object.values(targets)) {
 		const checked = spawnSync(process.execPath, ["--check", filePath], { encoding: "utf8" });
@@ -169,6 +173,7 @@ function main() {
 			`  client identity preserved; exact model never substituted\n` +
 			`  bounded hidden retries, failover, pool waits and a retryable 503\n` +
 			`  versioned affinity tombstones; advisory quota deferrals bounded\n` +
+			`  observed quota deadlines isolated by exact model\n` +
 			`  account router mandatory - no silent single-account fallback\n`,
 	);
 }

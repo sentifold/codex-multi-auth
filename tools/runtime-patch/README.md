@@ -59,6 +59,26 @@ what is running in production.
   counts. It never selects an account, attaches OAuth, contacts upstream, or
   mutates router state, and exposes no account identity.
 
+## Exact-model quota limits (r22)
+
+The source `AccountManager` and `payloads/codex-quota-scope.cjs` persist a limit
+observed for a named model only under that exact model. Sol and Astra share the
+`gpt-5.2` prompt family, but that is not evidence of a shared quota bucket. A Sol
+429 must keep its full deadline without excluding an otherwise usable Astra
+account. Explicit model-less limits retain their family-wide scope. The source
+regression checks real account-manager selection and save/reload behavior for
+quota, unknown, token, and concurrency reasons.
+
+The patch deliberately preserves existing family-wide records. For a legacy
+record contradicted by a **fresh successful exact-model live probe**, stop the
+singleton, back up the machine-local account store with owner-only permissions,
+remove only that verified stale record by account identity, and restart. Do not
+clear other accounts, copy credentials between machines, or infer recovery from
+an old cache entry. A successful normal Codex request is the recovery check.
+
+The managed dotfiles installer vendors this payload into a new immutable runtime
+before publication. Updating the pointer does not restart existing services.
+
 ## Requirements
 
 The patch matches exact compiled layouts, so it is pinned:
@@ -106,6 +126,8 @@ deliberately, install the new pinned version and re-run this patch.
 - `payloads/codex-model-catalog.cjs` — staged Astra/forecast backport for 2.9.1;
   accepts an absolute package root and optional `--check`. Managed installers
   apply this to a new immutable release before publishing its pointer.
+- `payloads/codex-quota-scope.cjs` — exact-model persisted quota limits, applied
+  and verified by `apply.cjs`; also accepts an absolute staged package root.
 - `payloads/check-*.cjs` — the verification payloads `--check` runs. Validation
   deliberately reuses these rather than a re-stated list of markers, because a
   hand-maintained copy drifts from what the patch actually writes.

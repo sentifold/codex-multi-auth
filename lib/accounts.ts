@@ -1276,15 +1276,15 @@ export class AccountManager {
 		const resetAt = nowMs() + retryMs;
 
 		const baseKey = getQuotaKey(family);
-		if (!model || reason === "quota" || reason === "unknown") {
+		// Prompt families select instruction templates, not shared quota buckets.
+		// A limit observed for one model must not disable its healthy siblings.
+		// Calls without a model retain their explicitly family-wide scope.
+		if (!model) {
 			const currentResetAt = account.rateLimitResetTimes[baseKey] ?? 0;
 			account.rateLimitResetTimes[baseKey] = Math.max(currentResetAt, resetAt);
 		}
 
-		if (
-			model &&
-			(reason === "tokens" || reason === "concurrent" || reason === "unknown")
-		) {
+		if (model) {
 			const modelKey = getQuotaKey(family, model);
 			const currentResetAt = account.rateLimitResetTimes[modelKey] ?? 0;
 			account.rateLimitResetTimes[modelKey] = Math.max(currentResetAt, resetAt);

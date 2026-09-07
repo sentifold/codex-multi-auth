@@ -2261,7 +2261,7 @@ describe("runtime rotation proxy", () => {
 		});
 		expect(proxy.getStatus()).not.toHaveProperty("lastAccountEmail");
 		expect(
-			accountManager.getAccountByIndex(0)?.rateLimitResetTimes["gpt-5-codex"],
+			accountManager.getAccountByIndex(0)?.rateLimitResetTimes["gpt-5-codex:gpt-5-codex"],
 		).toBeTypeOf("number");
 	});
 
@@ -2283,7 +2283,7 @@ describe("runtime rotation proxy", () => {
 			"acc_2",
 		]);
 		expect(
-			(accountManager.getAccountByIndex(0)?.rateLimitResetTimes["gpt-5-codex"] ?? 0) -
+			(accountManager.getAccountByIndex(0)?.rateLimitResetTimes["gpt-5-codex:gpt-5-codex"] ?? 0) -
 				Date.now(),
 		).toBeGreaterThan(60 * 60 * 1_000);
 	});
@@ -2756,6 +2756,32 @@ describe("runtime rotation proxy", () => {
 		expect(accountManager.getAccountByIndex(1)?.enabled).toBe(true);
 	});
 
+	it("serves Astra on the same account after a Sol quota rejection without retrying spent Sol", async () => {
+		const accountManager = new AccountManager(undefined, createStorage(Date.now(), 1));
+		const { calls, fetchImpl } = createRecordingFetch((call) => {
+			const body = JSON.parse(call.bodyText) as { model: string };
+			if (body.model === "gpt-5.6-sol") {
+				return new Response(JSON.stringify({ error: { code: "usage_limit_reached" } }), {
+					status: HTTP_STATUS.TOO_MANY_REQUESTS,
+					headers: { "content-type": "application/json", "retry-after": "86400" },
+				});
+			}
+			return textEventStream("data: astra-ok\n\n");
+		});
+		const proxy = await startProxy({ accountManager, fetchImpl, options: { forcedAccountIndex: 0 } });
+		const spent = await postResponses(proxy, { model: "gpt-5.6-sol" });
+		expect(spent.status).toBe(HTTP_STATUS.SERVICE_UNAVAILABLE);
+		await spent.text();
+		const healthy = await postResponses(proxy, { model: "gpt-6-astra" });
+		expect(healthy.status).toBe(HTTP_STATUS.OK);
+		expect(await healthy.text()).toBe("data: astra-ok\n\n");
+		const stillSpent = await postResponses(proxy, { model: "gpt-5.6-sol" });
+		expect(stillSpent.status).toBe(HTTP_STATUS.SERVICE_UNAVAILABLE);
+		await stillSpent.text();
+		expect(calls.map((call) => JSON.parse(call.bodyText).model)).toEqual(["gpt-5.6-sol", "gpt-6-astra"]);
+		expect(calls.map((call) => call.headers.get(OPENAI_HEADERS.ACCOUNT_ID))).toEqual(["acc_1", "acc_1"]);
+	});
+
 	it("persists cooldowns so a restarted proxy avoids limited accounts", async () => {
 		const now = Date.now();
 		const persisted: AccountStorageV3[] = [];
@@ -2788,7 +2814,7 @@ describe("runtime rotation proxy", () => {
 		const reloadedStorage = persisted.at(-1);
 		expect(reloadedStorage).toBeDefined();
 		if (!reloadedStorage) throw new Error("expected persisted storage");
-		expect(reloadedStorage?.accounts[0]?.rateLimitResetTimes["gpt-5-codex"]).toBeTypeOf(
+		expect(reloadedStorage?.accounts[0]?.rateLimitResetTimes["gpt-5-codex:gpt-5-codex"]).toBeTypeOf(
 			"number",
 		);
 		const secondManager = new AccountManager(undefined, reloadedStorage);

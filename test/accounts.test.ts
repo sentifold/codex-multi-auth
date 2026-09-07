@@ -1268,6 +1268,36 @@ describe("AccountManager", () => {
 	});
 
 	describe("markRateLimitedWithReason", () => {
+		it.each(["quota", "unknown", "tokens", "concurrent"] as const)(
+			"keeps a %s limit isolated between models sharing a prompt family after save and reload",
+			async (reason) => {
+				const now = Date.now();
+				const manager = new AccountManager(undefined, {
+					version: 3,
+					activeIndex: 0,
+					accounts: [{ refreshToken: "token-1", addedAt: now, lastUsed: now }],
+				});
+				const account = manager.getCurrentAccount()!;
+				const waitMs = 6 * 24 * 60 * 60 * 1000;
+				manager.markRateLimitedWithReason(account, waitMs, "gpt-5.2", reason, "gpt-5.6-sol");
+				const deadline = account.rateLimitResetTimes["gpt-5.2:gpt-5.6-sol"]!;
+				expect(deadline).toBeGreaterThanOrEqual(now + waitMs);
+				expect(manager.getManagedAccountRuntimeSkipReason(account, "gpt-5.2", "gpt-5.6-sol")).toBe("rate-limited");
+				expect(manager.getManagedAccountRuntimeSkipReason(account, "gpt-5.2", "gpt-6-astra")).toBeNull();
+
+				await manager.saveToDisk();
+				const { saveAccounts } = await import("../lib/storage.js");
+				const saved = vi.mocked(saveAccounts).mock.calls.at(-1)?.[0];
+				expect(saved).toBeDefined();
+				const reloaded = new AccountManager(undefined, saved);
+				const restored = reloaded.getCurrentAccount()!;
+				expect(reloaded.getManagedAccountRuntimeSkipReason(restored, "gpt-5.2", "gpt-5.6-sol")).toBe("rate-limited");
+				expect(reloaded.getManagedAccountRuntimeSkipReason(restored, "gpt-5.2", "gpt-6-astra")).toBeNull();
+				reloaded.markRateLimitedWithReason(restored, 1000, "gpt-5.2", reason, "gpt-5.6-sol");
+				expect(restored.rateLimitResetTimes["gpt-5.2:gpt-5.6-sol"]).toBe(deadline);
+			},
+		);
+
 		it("marks account as rate limited with reason", () => {
 			const now = Date.now();
 			const stored = {
@@ -4080,7 +4110,7 @@ describe("AccountManager", () => {
 			expect(score).toBeLessThan(100);
 		});
 
-		it("scopes quota rate limits to the family bucket only", () => {
+		it("scopes quota rate limits to the requested model bucket", () => {
 			const now = Date.now();
 			const stored = {
 				version: 3 as const,
@@ -4099,8 +4129,8 @@ describe("AccountManager", () => {
 				"gpt-5.1",
 			);
 
-			expect(account.rateLimitResetTimes.codex).toBeTypeOf("number");
-			expect(account.rateLimitResetTimes["codex:gpt-5.1"]).toBeUndefined();
+			expect(account.rateLimitResetTimes.codex).toBeUndefined();
+			expect(account.rateLimitResetTimes["codex:gpt-5.1"]).toBeTypeOf("number");
 		});
 
 		it("scopes token rate limits to the model bucket", () => {
