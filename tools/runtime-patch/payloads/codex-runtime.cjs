@@ -12,6 +12,7 @@ const nonResponsesRoutingHintMarker = "codex-multi-auth r9 policy: strip Fast ro
 const standardTierMarker = "codex-multi-auth r14 policy: force Standard service tier";
 const standardRoutingHintMarker = "codex-multi-auth r14 policy: bind canonical Standard routing hint to exact model";
 const standardNonResponsesRoutingHintMarker = "codex-multi-auth r14 policy: strip managed routing hint from non-Responses requests";
+const clientTierMarker = "codex-multi-auth r23 policy: honor per-request service tier";
 const managedTierMarker = "codex-multi-auth r15 policy: enforce machine-local service tier";
 const managedRoutingHintMarker = "codex-multi-auth r15 policy: bind canonical machine-local routing hint";
 const managedNonResponsesRoutingHintMarker = "codex-multi-auth r15 policy: strip managed routing hint from non-Responses requests";
@@ -390,7 +391,7 @@ const legacyManagedTierHelper = [
   "    throw new Error(\"CODEX_MANAGED_SERVICE_TIER must be default or fast\");",
   "})();",
 ].join("\n");
-if (source.includes(managedTierMarker) &&
+if (source.includes(managedTierMarker) && !source.includes(clientTierMarker) &&
     !source.includes('if (configured === "ultrafast") return Object.freeze({ label: "ultrafast", wire: "ultrafast" });')) {
   const legacyManagedTierFirst = source.indexOf(legacyManagedTierHelper);
   if (legacyManagedTierFirst < 0 ||
@@ -2238,6 +2239,49 @@ if (source.includes(sharedAdmissionMarker)) {
   if (refundCalls.length === 8) source = source.replace(refundPattern, "");
 }
 
+if (!source.includes(clientTierMarker)) {
+  const oldHelper = [
+    "const MANAGED_SERVICE_TIER = (() => {",
+    "    const configured = String(process.env.CODEX_MANAGED_SERVICE_TIER ?? \"default\").trim();",
+    "    if (configured === \"default\") return Object.freeze({ label: \"default\", wire: \"default\" });",
+    "    if (configured === \"fast\") return Object.freeze({ label: \"fast\", wire: \"priority\" });",
+    "    if (configured === \"ultrafast\") return Object.freeze({ label: \"ultrafast\", wire: \"ultrafast\" });",
+    "    throw new Error(\"CODEX_MANAGED_SERVICE_TIER must be default, fast, or ultrafast\");",
+    "})();",
+    "function managedServiceTierWireValue() { return MANAGED_SERVICE_TIER.wire; }",
+    "function managedServiceTierLabel() { return MANAGED_SERVICE_TIER.label; }",
+  ].join("\n");
+  const clientHelper = [
+    "// codex-multi-auth r23 policy: honor per-request service tier.",
+    "function managedServiceTierWireValue(parsedBody) {",
+    "    switch (parsedBody?.service_tier) {",
+    "        case undefined:",
+    "        case null:",
+    "        case \"auto\":",
+    "        case \"default\": return \"default\";",
+    "        case \"fast\":",
+    "        case \"priority\": return \"priority\";",
+    "        case \"ultrafast\": return \"ultrafast\";",
+    "        default: throw createRuntimeProxyHttpError(\"Unsupported Codex request service_tier.\", 400, \"codex_invalid_service_tier\");",
+    "    }",
+    "}",
+    "// Pool status has no session: serviceTier reports only the omitted-tier fallback.",
+    "function managedServiceTierLabel() { return \"default\"; }",
+  ].join("\n");
+  const tierRewrites = [
+    [oldHelper, clientHelper],
+    ['service_tier: managedServiceTierWireValue()', 'service_tier: managedServiceTierWireValue(parsedBody)'],
+    ['tier=${managedServiceTierWireValue()}', 'tier=${managedServiceTierWireValue(parsedBody)}'],
+  ];
+  for (const [needle, replacement] of tierRewrites) {
+    const first = source.indexOf(needle);
+    if (first < 0 || source.indexOf(needle, first + needle.length) >= 0) {
+      throw new Error("unsupported Codex per-request tier migration layout; refusing an unsafe patch");
+    }
+    source = source.slice(0, first) + replacement + source.slice(first + needle.length);
+  }
+}
+
 const requiredSnippets = [
   identityMarker,
   rotationMarker,
@@ -2252,17 +2296,20 @@ const requiredSnippets = [
   terminalExhaustionMarker,
   poolStatusMarker,
   advisoryQuotaMarker,
-  'const MANAGED_SERVICE_TIER = (() => {',
-  'if (configured === "default") return Object.freeze({ label: "default", wire: "default" });',
-  'if (configured === "fast") return Object.freeze({ label: "fast", wire: "priority" });',
-  'if (configured === "ultrafast") return Object.freeze({ label: "ultrafast", wire: "ultrafast" });',
-  'CODEX_MANAGED_SERVICE_TIER must be default, fast, or ultrafast',
-  'service_tier: managedServiceTierWireValue()',
+  "codex-multi-auth r23 policy: honor per-request service tier",
+  'function managedServiceTierWireValue(parsedBody) {',
+  'switch (parsedBody?.service_tier)',
+  'case "default": return "default";',
+  'case "priority": return "priority";',
+  'case "ultrafast": return "ultrafast";',
+  'Unsupported Codex request service_tier.',
+  '400, "codex_invalid_service_tier"',
+  'service_tier: managedServiceTierWireValue(parsedBody)',
   'headers.delete("x-codex-routing-hint");',
   "    if (!model || parsedBody.model !== model ||",
   "        !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(model)) {",
   'Codex Responses model must be a canonical model slug before managed service-tier routing can be enforced.',
-  'headers.set("x-codex-routing-hint", `model=${model};tier=${managedServiceTierWireValue()}`);',
+  'headers.set("x-codex-routing-hint", `model=${model};tier=${managedServiceTierWireValue(parsedBody)}`);',
   "const managedTierBody = forceManagedServiceTier(parsedBody);",
   "body: managedTierBody",
   'accountSkipReasons.set(refreshed.account.index, "model-unsupported")',
@@ -2303,6 +2350,9 @@ const requiredSnippets = [
   "codex_managed_pool_status_unavailable",
 ];
 const forbiddenTierSnippets = [
+  "const MANAGED_SERVICE_TIER",
+  "process.env.CODEX_MANAGED_SERVICE_TIER",
+  "managedServiceTierWireValue()",
   legacyStandardTierMarker,
   standardTierMarker,
   standardRoutingHintMarker,
@@ -2331,7 +2381,7 @@ const exactRoutingSnippetCounts = new Map([
   [managedRoutingHintMarker, 1],
   [managedNonResponsesRoutingHintMarker, 1],
   ['headers.delete("x-codex-routing-hint");', 2],
-  ['headers.set("x-codex-routing-hint", `model=${model};tier=${managedServiceTierWireValue()}`);', 1],
+  ['headers.set("x-codex-routing-hint", `model=${model};tier=${managedServiceTierWireValue(parsedBody)}`);', 1],
   ["    if (!model || parsedBody.model !== model ||", 1],
   ['Codex Responses model must be a canonical model slug before managed service-tier routing can be enforced.', 1],
 ]);

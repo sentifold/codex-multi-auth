@@ -19,45 +19,9 @@ const home = process.env.HOME;
 const modulePath = process.env.AGENT_CODEX_ROUTER_MODULE_PATH;
 const keyPath = process.env.AGENT_CODEX_ROUTER_KEY_PATH ??
   (home ? join(home, ".codex", "multi-auth", "machine-router-client-key") : null);
-// Canonical and deliberately not overridable. The setup preflight validates this
-// exact path while the old singleton is still serving; an env-selectable path let
-// the guard check one file and the daemon read another, which is a crash-loop with
-// no listener on 127.0.0.1:17892.
-const serviceTierPath = home
-  ? join(home, ".config", "agent-router", "codex-service-tier")
-  : null;
-
-if (!home || !modulePath || !keyPath || !serviceTierPath ||
+if (!home || !modulePath || !keyPath ||
     !Number.isInteger(port) || port < 1 || port > 65535) {
   throw new Error("Codex account-router daemon is missing a managed path or valid port.");
-}
-
-function readManagedServiceTier(path) {
-  let tier;
-  try {
-    const tierStat = lstatSync(path, { bigint: false });
-    if (!tierStat.isFile() || tierStat.isSymbolicLink() ||
-        tierStat.uid !== process.getuid() || (tierStat.mode & 0o777) !== 0o600) {
-      throw new Error(
-        "Codex service-tier setting must be an owner-only user-owned regular file.",
-      );
-    }
-    // Strip EVERY trailing newline, matching the zsh `$(<file)` the config
-    // syncer validates with. Removing only one accepted `fast` there and threw
-    // here, and the singleton is replaced before this runs -- so a stray blank
-    // line at the end of a machine-local file took the router down with no
-    // rollback rather than being rejected up front.
-    tier = readFileSync(path, "utf8").replace(/\n+$/, "");
-  } catch (error) {
-    if (error?.code === "ENOENT") return "default";
-    throw error;
-  }
-  if (tier !== "default" && tier !== "fast" && tier !== "ultrafast") {
-    throw new Error(
-      "Codex service-tier setting must contain exactly default, fast, or ultrafast.",
-    );
-  }
-  return tier;
 }
 
 function readOrCreateClientKey(path) {
@@ -93,7 +57,8 @@ function readOrCreateClientKey(path) {
 }
 
 const clientApiKey = readOrCreateClientKey(keyPath);
-process.env.CODEX_MANAGED_SERVICE_TIER = readManagedServiceTier(serviceTierPath);
+// Retired machine-wide override must never affect per-task speed.
+delete process.env.CODEX_MANAGED_SERVICE_TIER;
 const proxyModule = await import(pathToFileURL(modulePath).href);
 if (typeof proxyModule.startRuntimeRotationProxy !== "function") {
   throw new Error("Managed codex-multi-auth runtime proxy export is unavailable.");

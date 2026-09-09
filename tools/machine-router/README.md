@@ -75,15 +75,6 @@ The URL must be loopback; anything else is refused. If either variable is set
 and the pair is invalid, the wrapper fails closed rather than silently falling
 back to a private proxy.
 
-## Optional: service tier
-
-`~/.config/agent-router/codex-service-tier` selects the wire service tier for
-the whole machine. It must be an owner-only (`0600`) regular file containing
-exactly `default`, `fast`, or `ultrafast`. An absent file means `default`. The
-path is deliberately not overridable by an environment variable: an
-env-selectable path let a preflight validate one file while the daemon read
-another, which crash-looped the service with no listener on the port.
-
 ## Optional: advisory quota horizon
 
 `CODEX_AUTH_PREEMPTIVE_QUOTA_MAX_DEFERRAL_MS` bounds how long a *derived*
@@ -104,3 +95,10 @@ launchctl kickstart -k gui/$UID/<your-label>
 Open sessions keep a valid provider URL and pick up the replacement on their
 next request. An in-flight stream may fail during replacement, which is why
 this is a scheduled operation rather than something to do mid-turn.
+
+## Task speed (r23)
+
+The daemon no longer reads `~/.config/agent-router/codex-service-tier` and drops
+`CODEX_MANAGED_SERVICE_TIER` before importing the proxy. Each request selects its
+own tier. Enable `features.fast_mode = true` in Codex while retaining the user's
+`service_tier` default; the default for an absent preference is Standard.

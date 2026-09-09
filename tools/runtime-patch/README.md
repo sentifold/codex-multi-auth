@@ -14,6 +14,15 @@ what is running in production.
 
 ## What it changes
 
+- **Per-task speed (r23).** Requests keep their selected Standard or Fast tier;
+  omitted/null/`auto` means Standard and `fast` normalizes to `priority`.
+  The routing hint is rebuilt from that same tier and exact model, then frozen
+  across retries and failover. The retired machine file/environment override
+  is ignored. Existing explicit `ultrafast` still passes through without changing
+  its availability. Pool status `serviceTier` reports the Standard fallback,
+  not any active task. Enable Codex's `features.fast_mode` independently from
+  the user's default speed; configuration sync must preserve that preference.
+
 - **Astra-aware quota diagnostics.** `gpt-6-astra` stays exact and probes use
   `low`, matching the [official reasoning range](https://developers.openai.com/api/docs/models/gpt-6-astra).
   An explicit forecast model disables fallback; unknown models or a mismatched
