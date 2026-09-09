@@ -140,3 +140,25 @@ deliberately, install the new pinned version and re-run this patch.
 - `payloads/check-*.cjs` — the verification payloads `--check` runs. Validation
   deliberately reuses these rather than a re-stated list of markers, because a
   hand-maintained copy drifts from what the patch actually writes.
+
+## Live credential convergence (r24)
+
+A resident router used to preserve a newer external OAuth rotation only in its
+saved snapshot. Its live AccountManager continued to send the old access token,
+producing repeating authentication cooldowns and pool 503s even with available
+quota. After a successful routine persistence, the same live account objects now
+adopt strictly newer persisted token material, matched by account identity.
+The post-write expiry check protects newer concurrent refreshes. Failed writes
+do not publish a new in-memory credential state.
+
+This does not reload the pool or reset quota, pause, pin, cooldown, invalidation,
+or request model/tier. An existing auth cooldown expires normally (usually 30s).
+Explicit revocation still requires the existing recovery/login path. This closes
+the stale-memory failure; it cannot prevent real upstream outages or spent quota.
+
+`payloads/codex-auth-convergence.cjs` ports the source fix to pinned npm 2.9.1.
+Its byte-identical dotfiles copy is `.bin/lib/codex-auth-convergence.cjs`.
+Source regressions live in `test/rotation-token-refresh.test.ts`; the offline
+installed-package regression is `.bin/tests/test-codex-auth-convergence.sh` in
+dotfiles. It runs an actual 401, external credential write, routine save, and a
+successful second Astra/Fast request through the same running proxy.

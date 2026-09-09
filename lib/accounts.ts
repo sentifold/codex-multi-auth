@@ -1481,6 +1481,29 @@ export class AccountManager {
 		return snapshot;
 	}
 
+	/**
+	 * Routine saves preserve external rotations on disk; the live pool must
+	 * converge too, or a resident proxy keeps sending a stale access token.
+	 * Run only after persistence succeeds, and compare again after the await
+	 * so an in-flight refresh cannot be rolled back. Keep the same objects and
+	 * all routing, quota, cooldown, pause and explicit invalidation state.
+	 */
+	private adoptPersistedTokens(snapshot: AccountStorageV3): void {
+		const storedByIdentity = new Map(
+			snapshot.accounts.map((account) => [getAccountIdentityKey(account), account]),
+		);
+		for (const account of this.accounts) {
+			const key = getAccountIdentityKey(account);
+			if (!key) continue;
+			const stored = storedByIdentity.get(key);
+			if (stored?.refreshToken && (stored.expiresAt ?? 0) > (account.expires ?? 0)) {
+				account.refreshToken = stored.refreshToken;
+				account.access = stored.accessToken;
+				account.expires = stored.expiresAt;
+			}
+		}
+	}
+
 	private buildStorageSnapshot(): AccountStorageV3 {
 		const activeIndexByFamily: Partial<Record<ModelFamily, number>> = {};
 		for (const family of MODEL_FAMILIES) {
@@ -1999,9 +2022,12 @@ export class AccountManager {
 				// Reconcile against the disk state loaded under the storage lock so a
 				// routine save does not clobber a token another process just rotated
 				// (stress audit H3).
-				await persist(
-					this.reconcileTokensFromDisk(this.buildStorageSnapshot(), current),
+				const snapshot = this.reconcileTokensFromDisk(
+					this.buildStorageSnapshot(),
+					current,
 				);
+				await persist(snapshot);
+				this.adoptPersistedTokens(snapshot);
 			});
 		});
 	}

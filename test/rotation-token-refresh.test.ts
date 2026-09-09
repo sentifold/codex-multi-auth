@@ -374,3 +374,82 @@ describe("applyMonotonicAuthCooldown", () => {
 		).toBeGreaterThan(firstDeadline);
 	});
 });
+
+
+describe("external credential rotation in a long-lived manager", () => {
+	function externallyRotatedStorage() {
+		return storageWith(NOW + 7_200_000, {
+			accessToken: "access-external",
+			refreshToken: "refresh-external",
+		});
+	}
+
+	it("uses disk-rotated auth after a routine 401 save without replacing the manager", async () => {
+		const manager = managerWith(FRESH_EXPIRES);
+		const account = refreshParams(manager).account;
+		applyMonotonicAuthCooldown(manager, account, DEFAULT_AUTH_FAILURE_COOLDOWN_MS);
+		const cooldown = account.coolingDownUntil;
+		const disk = externallyRotatedStorage();
+		const persist = vi.fn().mockResolvedValue(undefined);
+		withAccountStorageTransactionMock.mockImplementation(async (handler) => handler(disk, persist));
+
+		manager.saveToDiskDebounced();
+		await manager.flushPendingSave();
+
+		expect(manager.getAccountByIndex(0)).toBe(account);
+		expect(account.refreshToken).toBe("refresh-external");
+		expect(account.coolingDownUntil).toBe(cooldown);
+		const result = await ensureFreshAccessToken({ ...refreshParams(manager), model: "gpt-6-astra" });
+		expect(result).toMatchObject({ ok: true, accessToken: "access-external" });
+		expect(queuedRefreshMock).not.toHaveBeenCalled();
+		expect(persist.mock.calls[0]?.[0].accounts[0].accessToken).toBe("access-external");
+	});
+
+	it("preserves disabled accounts, real quota, invalidation and routing state", async () => {
+		const manager = managerWith(FRESH_EXPIRES, { enabled: false });
+		const account = refreshParams(manager).account;
+		manager.markRateLimited(account, 120_000, FAMILY, "gpt-6-astra");
+		manager.markAuthInvalidated(account);
+		const before = structuredClone(account);
+		withAccountStorageTransactionMock.mockImplementation(async (handler) => handler(externallyRotatedStorage(), async () => undefined));
+		await manager.saveToDisk();
+		expect(account).toEqual({ ...before, access: "access-external", refreshToken: "refresh-external", expires: NOW + 7_200_000 });
+	});
+
+	it("does not publish new live auth when persistence fails", async () => {
+		const manager = managerWith(FRESH_EXPIRES);
+		const account = refreshParams(manager).account;
+		withAccountStorageTransactionMock.mockImplementation(async (handler) => handler(externallyRotatedStorage(), async () => { throw new Error("disk full"); }));
+		await expect(manager.saveToDisk()).rejects.toThrow("disk full");
+		expect(account.access).toBe("access-1");
+	});
+
+	it("does not overwrite a newer concurrent refresh while a save is pending", async () => {
+		const manager = managerWith(FRESH_EXPIRES);
+		const account = refreshParams(manager).account;
+		withAccountStorageTransactionMock.mockImplementation(async (handler) => handler(externallyRotatedStorage(), async () => {
+			manager.updateFromAuth(account, { type: "oauth", access: "access-latest", refresh: "refresh-latest", expires: NOW + 10_800_000 });
+		}));
+		await manager.saveToDisk();
+		expect(account.access).toBe("access-latest");
+		expect(account.refreshToken).toBe("refresh-latest");
+	});
+
+	it.each([0, -60_000])("does not replace auth with equal or older disk expiry (%s)", async (offset) => {
+		const manager = managerWith(FRESH_EXPIRES);
+		const disk = externallyRotatedStorage();
+		disk.accounts[0]!.expiresAt = FRESH_EXPIRES + offset;
+		withAccountStorageTransactionMock.mockImplementation(async (handler) => handler(disk, async () => undefined));
+		await manager.saveToDisk();
+		expect(refreshParams(manager).account.access).toBe("access-1");
+	});
+
+	it("matches identity instead of reordered account indices", async () => {
+		const manager = managerWith(FRESH_EXPIRES);
+		const disk = externallyRotatedStorage();
+		disk.accounts.unshift({ ...disk.accounts[0]!, accountId: "other", email: "other@example.com", accessToken: "access-other", refreshToken: "refresh-other", expiresAt: NOW + 10_800_000 });
+		withAccountStorageTransactionMock.mockImplementation(async (handler) => handler(disk, async () => undefined));
+		await manager.saveToDisk();
+		expect(refreshParams(manager).account.access).toBe("access-external");
+	});
+});
