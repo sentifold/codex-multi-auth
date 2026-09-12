@@ -142,7 +142,8 @@ function main() {
 		const catalog = spawnSync(process.execPath, [path.join(__dirname, "payloads/codex-model-catalog.cjs"), packageRoot, "--check"], { stdio: "inherit" });
 		const quotaScope = spawnSync(process.execPath, [path.join(__dirname, "payloads/codex-quota-scope.cjs"), packageRoot, "--check"], { stdio: "inherit" });
 		const authConvergence = spawnSync(process.execPath, [path.join(__dirname, "payloads/codex-auth-convergence.cjs"), packageRoot, "--check"], { stdio: "inherit" });
-		process.exit(verify(targets, { quiet: false }) && catalog.status === 0 && quotaScope.status === 0 && authConvergence.status === 0 ? 0 : 1);
+		const subscription = spawnSync(process.execPath, [path.join(__dirname, "payloads/subscription-priority.cjs"), packageRoot, "codex", "--check"], { stdio: "inherit" });
+		process.exit(verify(targets, { quiet: false }) && catalog.status === 0 && quotaScope.status === 0 && authConvergence.status === 0 && subscription.status === 0 ? 0 : 1);
 	}
 
 	const runtime = runPayload("codex-runtime.cjs", targets);
@@ -159,6 +160,8 @@ function main() {
 	if (quotaScope.status !== 0) fail("the quota scope patch aborted");
 	const authConvergence = spawnSync(process.execPath, [path.join(__dirname, "payloads/codex-auth-convergence.cjs"), packageRoot], { stdio: "inherit" });
 	if (authConvergence.status !== 0) fail("the live credential convergence patch aborted");
+	const subscription = spawnSync(process.execPath, [path.join(__dirname, "payloads/subscription-priority.cjs"), packageRoot, "codex"], { stdio: "inherit" });
+	if (subscription.status !== 0) fail("the subscription priority patch aborted");
 
 	for (const filePath of Object.values(targets)) {
 		const checked = spawnSync(process.execPath, ["--check", filePath], { encoding: "utf8" });
