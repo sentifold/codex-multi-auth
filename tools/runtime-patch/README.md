@@ -163,6 +163,35 @@ installed-package regression is `.bin/tests/test-codex-auth-convergence.sh` in
 dotfiles. It runs an actual 401, external credential write, routine save, and a
 successful second Astra/Fast request through the same running proxy.
 
+### r28: a re-login releases the replaced credential's invalidation
+
+On 2026-09-23 every request through a resident router got a 503 although the
+invalidated account had signed in again the day before. Routine saves adopted
+the new credential (r24) but wrote the old credential's explicit invalidation
+back over the login, and the live account stayed skipped as `token-invalid`.
+
+An explicit invalidation and an auth-failure cooldown belong to the credential
+that earned them. When reconciliation takes a different refresh token with a
+later expiry from disk, and that disk record is not itself invalidated, the
+snapshot drops the invalidation, its error code and an `auth-failure` cooldown
+before it is persisted. After the write succeeds, the live account drops the
+same state and its consecutive auth-failure count. Refresh persistence
+(`commitRefreshedAuth`) now reconciles the other accounts the same way, so a
+refresh of one account can no longer revert a login written for another.
+
+Kept: an invalidation of the same refresh token (even with a newer expiry), a
+disk record that is itself invalidated, rate-limit/server/network cooldowns,
+quota windows, disabled accounts, policy pauses and drains, pins and session
+affinity. A marker already written back for the current refresh token looks
+exactly like a real invalidation, so r28 keeps it; a new login (a new refresh
+token) or the manual repair clears it.
+
+The payload upgrades an r24-patched `accounts.js` in place, byte-identical to
+patching the unpatched file, and `--check` rejects an r24 file with an explicit
+upgrade message. Any other layout is refused before a write. Required as a
+module, it exports `render(source, layout)` (`base`, `r24`, `r28`) so tests can
+derive each layout from a staged copy.
+
 
 ### r25: opt-in subscription final-week preference
 

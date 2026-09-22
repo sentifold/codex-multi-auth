@@ -1361,7 +1361,9 @@ export class AccountManager {
 		delete account.authInvalidationErrorCode;
 	}
 
-	isAccountAuthInvalidated(account: ManagedAccount): boolean {
+	isAccountAuthInvalidated(
+		account: Pick<ManagedAccount, "authInvalidatedAt">,
+	): boolean {
 		return (
 			typeof account.authInvalidatedAt === "number" &&
 			Number.isFinite(account.authInvalidatedAt) &&
@@ -1425,6 +1427,13 @@ export class AccountManager {
 	 * strictly newer token (later expiresAt), adopt the disk's token material.
 	 * Our own freshly-refreshed tokens always have the newest expiry, so this
 	 * never undoes a refresh we just performed.
+	 *
+	 * When that newer disk token is a different refresh token (a re-login or
+	 * an external rotation) and the disk record is not itself invalidated, the
+	 * snapshot also drops the explicit invalidation and auth-failure cooldown
+	 * the old credential earned. This is decided here, before persisting, so a
+	 * resident manager cannot write a stale marker back over the new login;
+	 * adoptPersistedTokens applies the same release to the live account.
 	 */
 	private reconcileTokensFromDisk(
 		snapshot: AccountStorageV3,
@@ -1455,6 +1464,12 @@ export class AccountManager {
 			// so we don't clobber another process's rotation. Equal expiries keep
 			// our copy (no-op); newer in-memory copy wins (our own refresh).
 			if (diskExpires > memExpires && disk.refreshToken) {
+				if (
+					disk.refreshToken !== account.refreshToken &&
+					!this.isAccountAuthInvalidated(disk)
+				) {
+					this.releaseReplacedCredentialAuthState(account);
+				}
 				account.refreshToken = disk.refreshToken;
 				account.accessToken = disk.accessToken;
 				account.expiresAt = disk.expiresAt;
@@ -1486,7 +1501,12 @@ export class AccountManager {
 	 * converge too, or a resident proxy keeps sending a stale access token.
 	 * Run only after persistence succeeds, and compare again after the await
 	 * so an in-flight refresh cannot be rolled back. Keep the same objects and
-	 * all routing, quota, cooldown, pause and explicit invalidation state.
+	 * all routing, quota, non-auth cooldown, pause and enablement state.
+	 *
+	 * Switching to a different refresh token mirrors the record just persisted:
+	 * unless that record is itself invalidated, the old credential's explicit
+	 * invalidation, auth-failure cooldown and failure count go with it, so a
+	 * re-login is routable again without restarting the resident router.
 	 */
 	private adoptPersistedTokens(snapshot: AccountStorageV3): void {
 		const storedByIdentity = new Map(
@@ -1497,10 +1517,41 @@ export class AccountManager {
 			if (!key) continue;
 			const stored = storedByIdentity.get(key);
 			if (stored?.refreshToken && (stored.expiresAt ?? 0) > (account.expires ?? 0)) {
+				if (
+					stored.refreshToken !== account.refreshToken &&
+					!this.isAccountAuthInvalidated(stored)
+				) {
+					this.releaseReplacedCredentialAuthState(account);
+					this.clearAuthFailures(account);
+				}
 				account.refreshToken = stored.refreshToken;
 				account.access = stored.accessToken;
 				account.expires = stored.expiresAt;
 			}
+		}
+	}
+
+	/**
+	 * An explicit invalidation and an auth-failure cooldown belong to the
+	 * credential that earned them, not to the account. Drop them from a
+	 * snapshot record or live account that is switching to a different
+	 * credential. Rate-limit, server and network cooldowns, quota windows,
+	 * enablement and routing state describe the account and stay.
+	 */
+	private releaseReplacedCredentialAuthState(
+		account: Pick<
+			ManagedAccount,
+			| "authInvalidatedAt"
+			| "authInvalidationErrorCode"
+			| "coolingDownUntil"
+			| "cooldownReason"
+		>,
+	): void {
+		delete account.authInvalidatedAt;
+		delete account.authInvalidationErrorCode;
+		if (account.cooldownReason === "auth-failure") {
+			delete account.coolingDownUntil;
+			delete account.cooldownReason;
 		}
 	}
 
@@ -1603,11 +1654,14 @@ export class AccountManager {
 		const nextAccountId = extractAccountId(auth.access)?.trim() || undefined;
 		const nextEmail = sanitizeEmail(extractAccountEmail(auth.access));
 		try {
-			return await withAccountStorageTransaction(async (_current, persist) => {
+			return await withAccountStorageTransaction(async (current, persist) => {
 				// Snapshot the live in-memory pool under the storage lock so refresh
-				// persistence merges against the latest account state.
+				// persistence merges against the latest account state. Reconcile the
+				// other accounts with disk exactly like a routine save: refreshing one
+				// account must not revert a credential a login or another process
+				// wrote for another, nor write that account's stale markers back.
 				const nextStorage = structuredClone(
-					this.buildStorageSnapshot(),
+					this.reconcileTokensFromDisk(this.buildStorageSnapshot(), current),
 				) as AccountStorageV3;
 				const storageIndex = findAccountIndexByIdentity(
 					nextStorage.accounts,
@@ -1713,10 +1767,12 @@ export class AccountManager {
 						throw error;
 					}
 
+					this.adoptPersistedTokens(nextStorage);
 					return liveAccount;
 				}
 
 				await persist(nextStorage);
+				this.adoptPersistedTokens(nextStorage);
 				log.warn("Unable to resolve refreshed live account after persistence", {
 					sourceIndex: source.index,
 				});

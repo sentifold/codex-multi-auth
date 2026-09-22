@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { AccountManager } from "../lib/accounts.js";
+import { AccountManager, AUTH_INVALIDATION_MARKER } from "../lib/accounts.js";
 import type { AccountStorageV3 } from "../lib/storage.js";
 
 const { queuedRefreshMock, saveAccountsMock, withAccountStorageTransactionMock } =
@@ -398,22 +398,37 @@ describe("external credential rotation in a long-lived manager", () => {
 
 		expect(manager.getAccountByIndex(0)).toBe(account);
 		expect(account.refreshToken).toBe("refresh-external");
-		expect(account.coolingDownUntil).toBe(cooldown);
+		// The 401 backoff was earned by the replaced token, not the new one.
+		expect(cooldown).toBeGreaterThan(NOW);
+		expect(account.coolingDownUntil).toBeUndefined();
+		expect(account.cooldownReason).toBeUndefined();
 		const result = await ensureFreshAccessToken({ ...refreshParams(manager), model: "gpt-6-astra" });
 		expect(result).toMatchObject({ ok: true, accessToken: "access-external" });
 		expect(queuedRefreshMock).not.toHaveBeenCalled();
-		expect(persist.mock.calls[0]?.[0].accounts[0].accessToken).toBe("access-external");
+		const persisted = persist.mock.calls[0]?.[0].accounts[0];
+		expect(persisted?.accessToken).toBe("access-external");
+		expect(persisted?.coolingDownUntil).toBeUndefined();
+		expect(persisted?.cooldownReason).toBeUndefined();
 	});
 
-	it("preserves disabled accounts, real quota, invalidation and routing state", async () => {
+	it("keeps disabled accounts, real quota and routing state while releasing the replaced credential's invalidation", async () => {
 		const manager = managerWith(FRESH_EXPIRES, { enabled: false });
 		const account = refreshParams(manager).account;
 		manager.markRateLimited(account, 120_000, FAMILY, "gpt-6-astra");
 		manager.markAuthInvalidated(account);
-		const before = structuredClone(account);
+		const { authInvalidatedAt, authInvalidationErrorCode, ...before } = structuredClone(account);
+		expect(authInvalidatedAt).toBeGreaterThan(0);
+		expect(authInvalidationErrorCode).toBe("token_invalidated");
 		withAccountStorageTransactionMock.mockImplementation(async (handler) => handler(externallyRotatedStorage(), async () => undefined));
 		await manager.saveToDisk();
-		expect(account).toEqual({ ...before, access: "access-external", refreshToken: "refresh-external", expires: NOW + 7_200_000 });
+		expect(account).toEqual({
+			...before,
+			access: "access-external",
+			refreshToken: "refresh-external",
+			expires: NOW + 7_200_000,
+			consecutiveAuthFailures: 0,
+		});
+		expect(manager.getAccountRuntimeSkipReason(0, FAMILY, "gpt-6-astra")).toBe("disabled");
 	});
 
 	it("does not publish new live auth when persistence fails", async () => {
@@ -451,5 +466,217 @@ describe("external credential rotation in a long-lived manager", () => {
 		withAccountStorageTransactionMock.mockImplementation(async (handler) => handler(disk, async () => undefined));
 		await manager.saveToDisk();
 		expect(refreshParams(manager).account.access).toBe("access-external");
+	});
+});
+
+describe("re-login while an explicit invalidation is resident", () => {
+	// 2026-09-23: a resident router kept a token_invalidated marker for an
+	// account that had signed in again the day before. Routine saves adopted
+	// the new credential but wrote the old marker back, so every request 503ed.
+	const INVALIDATED_AT = NOW - 3 * 86_400_000;
+	const RELOGIN_EXPIRES = NOW + 7_200_000;
+	const MODEL = "gpt-6-astra";
+
+	function invalidatedManager() {
+		const manager = managerWith(FRESH_EXPIRES);
+		const account = refreshParams(manager).account;
+		manager.markAuthInvalidated(account, "token_invalidated", INVALIDATED_AT);
+		applyMonotonicAuthCooldown(manager, account, INVALIDATION_COOLDOWN_MS);
+		manager.incrementAuthFailures(account);
+		manager.incrementAuthFailures(account);
+		return { manager, account };
+	}
+
+	// What a login writes: a new refresh token for the same identity with the
+	// invalidation cleared. It leaves the old cooldown fields in place.
+	function reloginStorage(
+		overrides: Partial<AccountStorageV3["accounts"][number]> = {},
+	): AccountStorageV3 {
+		return storageWith(RELOGIN_EXPIRES, {
+			accessToken: "access-relogin",
+			refreshToken: "refresh-relogin",
+			coolingDownUntil: NOW + INVALIDATION_COOLDOWN_MS,
+			cooldownReason: "auth-failure",
+			...overrides,
+		});
+	}
+
+	function statefulDisk(initial: AccountStorageV3) {
+		const disk = { current: structuredClone(initial) };
+		withAccountStorageTransactionMock.mockImplementation(async (handler) =>
+			handler(structuredClone(disk.current), async (storage: AccountStorageV3) => {
+				disk.current = structuredClone(storage);
+			}),
+		);
+		return disk;
+	}
+
+	it("routes the same live account again and never writes the old marker back", async () => {
+		const { manager, account } = invalidatedManager();
+		expect(manager.getAccountRuntimeSkipReason(0, FAMILY, MODEL)).toBe(AUTH_INVALIDATION_MARKER);
+		const disk = statefulDisk(reloginStorage());
+
+		await manager.saveToDisk();
+
+		const persisted = disk.current.accounts[0];
+		expect(persisted).toMatchObject({ refreshToken: "refresh-relogin", accessToken: "access-relogin" });
+		for (const field of ["authInvalidatedAt", "authInvalidationErrorCode", "coolingDownUntil", "cooldownReason"] as const) {
+			expect(persisted?.[field]).toBeUndefined();
+		}
+		expect(manager.getAccountByIndex(0)).toBe(account);
+		expect(account).toMatchObject({
+			refreshToken: "refresh-relogin",
+			access: "access-relogin",
+			expires: RELOGIN_EXPIRES,
+			consecutiveAuthFailures: 0,
+		});
+		expect(manager.isAccountAuthInvalidated(account)).toBe(false);
+		expect(account.authInvalidationErrorCode).toBeUndefined();
+		expect(account.coolingDownUntil).toBeUndefined();
+		expect(manager.getAccountRuntimeSkipReason(0, FAMILY, MODEL)).toBeNull();
+		expect(manager.getCurrentOrNextForFamily(FAMILY, MODEL)).toBe(account);
+		const result = await ensureFreshAccessToken({ ...refreshParams(manager), model: MODEL });
+		expect(result).toMatchObject({ ok: true, accessToken: "access-relogin" });
+		expect(queuedRefreshMock).not.toHaveBeenCalled();
+
+		await manager.saveToDisk();
+		expect(disk.current.accounts[0]?.authInvalidatedAt).toBeUndefined();
+	});
+
+	it("keeps an invalidation of the same refresh token even with a newer expiry", async () => {
+		const { manager, account } = invalidatedManager();
+		const disk = statefulDisk(storageWith(RELOGIN_EXPIRES, { accessToken: "access-topped-up" }));
+
+		await manager.saveToDisk();
+
+		expect(account).toMatchObject({
+			refreshToken: "refresh-1",
+			access: "access-topped-up",
+			authInvalidatedAt: INVALIDATED_AT,
+			cooldownReason: "auth-failure",
+			consecutiveAuthFailures: 2,
+		});
+		expect(manager.getAccountRuntimeSkipReason(0, FAMILY, MODEL)).toBe(AUTH_INVALIDATION_MARKER);
+		expect(disk.current.accounts[0]).toMatchObject({
+			authInvalidatedAt: INVALIDATED_AT,
+			authInvalidationErrorCode: "token_invalidated",
+			cooldownReason: "auth-failure",
+		});
+	});
+
+	it("keeps the invalidation when the new disk credential is itself marked invalid", async () => {
+		const { manager, account } = invalidatedManager();
+		const disk = statefulDisk(
+			reloginStorage({ authInvalidatedAt: NOW - 1_000, authInvalidationErrorCode: "token_revoked" }),
+		);
+
+		await manager.saveToDisk();
+
+		expect(account).toMatchObject({
+			refreshToken: "refresh-relogin",
+			authInvalidatedAt: INVALIDATED_AT,
+			cooldownReason: "auth-failure",
+			consecutiveAuthFailures: 2,
+		});
+		expect(manager.getAccountRuntimeSkipReason(0, FAMILY, MODEL)).toBe(AUTH_INVALIDATION_MARKER);
+		// Nothing is released: the persisted record keeps its marker and backoff.
+		expect(disk.current.accounts[0]).toMatchObject({
+			authInvalidatedAt: INVALIDATED_AT,
+			authInvalidationErrorCode: "token_invalidated",
+			cooldownReason: "auth-failure",
+		});
+	});
+
+	it("keeps rate-limit cooldowns and exact-model quota windows", async () => {
+		const manager = managerWith(FRESH_EXPIRES);
+		const account = refreshParams(manager).account;
+		manager.markAuthInvalidated(account, "token_invalidated", INVALIDATED_AT);
+		manager.markRateLimited(account, 6 * 86_400_000, FAMILY, MODEL);
+		manager.markAccountCoolingDown(account, 120_000, "rate-limit");
+		const quota = structuredClone(account.rateLimitResetTimes);
+		const cooldownUntil = account.coolingDownUntil;
+		const disk = statefulDisk(reloginStorage());
+
+		await manager.saveToDisk();
+
+		expect(manager.isAccountAuthInvalidated(account)).toBe(false);
+		const kept = { coolingDownUntil: cooldownUntil, cooldownReason: "rate-limit", rateLimitResetTimes: quota };
+		expect(account).toMatchObject({ refreshToken: "refresh-relogin", ...kept });
+		expect(disk.current.accounts[0]).toMatchObject(kept);
+		expect(manager.getAccountRuntimeSkipReason(0, FAMILY, MODEL)).toBe("rate-limited");
+	});
+
+	it("releases nothing when persistence fails", async () => {
+		const { manager, account } = invalidatedManager();
+		withAccountStorageTransactionMock.mockImplementation(async (handler) =>
+			handler(reloginStorage(), async () => {
+				throw new Error("disk full");
+			}),
+		);
+
+		await expect(manager.saveToDisk()).rejects.toThrow("disk full");
+
+		expect(account).toMatchObject({
+			refreshToken: "refresh-1",
+			authInvalidatedAt: INVALIDATED_AT,
+			cooldownReason: "auth-failure",
+			consecutiveAuthFailures: 2,
+		});
+	});
+
+	it("also releases a marker the old credential earns while the write is in flight", async () => {
+		const manager = managerWith(FRESH_EXPIRES);
+		const account = refreshParams(manager).account;
+		withAccountStorageTransactionMock.mockImplementation(async (handler) =>
+			handler(reloginStorage(), async () => {
+				// A request still holding the old token learns it was invalidated.
+				manager.markAuthInvalidated(account);
+				applyMonotonicAuthCooldown(manager, account, INVALIDATION_COOLDOWN_MS);
+			}),
+		);
+
+		await manager.saveToDisk();
+
+		expect(account.refreshToken).toBe("refresh-relogin");
+		expect(manager.getAccountRuntimeSkipReason(0, FAMILY, MODEL)).toBeNull();
+	});
+
+	it("does not let another account's refresh revert the re-login on disk", async () => {
+		const stored = storageWith(FRESH_EXPIRES);
+		const second = {
+			...stored.accounts[0]!,
+			accountId: "acc_2",
+			email: "account-2@example.com",
+			refreshToken: "refresh-2",
+			accessToken: "access-2",
+			expiresAt: STALE_EXPIRES,
+		};
+		stored.accounts.push(second);
+		const manager = new AccountManager(undefined, stored);
+		openManagers.push(manager);
+		const invalidated = manager.getAccountByIndex(0)!;
+		manager.markAuthInvalidated(invalidated, "token_invalidated", INVALIDATED_AT);
+		const relogin = reloginStorage();
+		relogin.accounts.push(structuredClone(second));
+		const disk = statefulDisk(relogin);
+		queuedRefreshMock.mockResolvedValue({
+			type: "success",
+			access: "access-2-new",
+			refresh: "refresh-2-new",
+			expires: NOW + 7_200_000,
+		});
+
+		const result = await ensureFreshAccessToken({
+			...refreshParams(manager),
+			account: manager.getAccountByIndex(1)!,
+			model: MODEL,
+		});
+
+		expect(result).toMatchObject({ ok: true, accessToken: "access-2-new" });
+		expect(disk.current.accounts[0]).toMatchObject({ refreshToken: "refresh-relogin", accessToken: "access-relogin" });
+		expect(disk.current.accounts[0]?.authInvalidatedAt).toBeUndefined();
+		expect(disk.current.accounts[1]).toMatchObject({ refreshToken: "refresh-2-new", accessToken: "access-2-new" });
+		expect(invalidated.refreshToken).toBe("refresh-relogin");
+		expect(manager.getAccountRuntimeSkipReason(0, FAMILY, MODEL)).toBeNull();
 	});
 });
