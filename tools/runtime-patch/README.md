@@ -203,6 +203,11 @@ router, with concurrent requests sharing one pass. A released account is
 selectable again in the same request. `payloads/check-proxy.cjs` requires that
 call exactly once, first in that branch.
 
+Both login writes clear the marker on disk: the CLI login
+(`lib/codex-manager/account-pool-write.ts`) always did, and the plugin host
+(`lib/runtime/account-pool.ts`) now does as well. The managed routers and the
+CLI never load the plugin host, so the runtime payloads leave that file alone.
+
 The payload upgrades an r24-patched `accounts.js` in place, byte-identical to
 patching the unpatched file, and `--check` rejects an r24 file with an explicit
 upgrade message. Any other layout is refused before a write. Required as a
