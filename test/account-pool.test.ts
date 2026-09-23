@@ -54,7 +54,10 @@ describe("account pool helper", () => {
 		});
 	});
 
-	it("clears the replaced credential's invalidation when an account signs in again", async () => {
+	// The plugin host's login write for an account that signs in again.
+	async function signInAgain(
+		fields: Partial<AccountStorageV3["accounts"][number]>,
+	): Promise<AccountStorageV3["accounts"][number] | undefined> {
 		const persist = vi.fn(async (_storage: AccountStorageV3) => undefined);
 		const stored: AccountStorageV3 = {
 			version: 3,
@@ -68,9 +71,8 @@ describe("account pool helper", () => {
 					expiresAt: 100,
 					addedAt: 1,
 					lastUsed: 1,
-					authInvalidatedAt: 50,
-					authInvalidationErrorCode: "token_invalidated",
 					rateLimitResetTimes: { codex: 999 },
+					...fields,
 				},
 			],
 		};
@@ -95,7 +97,17 @@ describe("account pool helper", () => {
 			sanitizeEmail: (email) => email,
 		});
 
-		const saved = persist.mock.calls[0]?.[0].accounts[0];
+		return persist.mock.calls[0]?.[0].accounts[0];
+	}
+
+	it("clears the replaced credential's invalidation and auth backoff when an account signs in again", async () => {
+		const saved = await signInAgain({
+			authInvalidatedAt: 50,
+			authInvalidationErrorCode: "token_invalidated",
+			coolingDownUntil: 400,
+			cooldownReason: "auth-failure",
+		});
+
 		expect(saved).toMatchObject({
 			refreshToken: "refresh-new",
 			accessToken: "access-new",
@@ -104,5 +116,20 @@ describe("account pool helper", () => {
 		});
 		expect(saved?.authInvalidatedAt).toBeUndefined();
 		expect(saved?.authInvalidationErrorCode).toBeUndefined();
+		expect(saved?.coolingDownUntil).toBeUndefined();
+		expect(saved?.cooldownReason).toBeUndefined();
+	});
+
+	it("keeps a rate-limit cooldown when an account signs in again", async () => {
+		const saved = await signInAgain({
+			coolingDownUntil: 400,
+			cooldownReason: "rate-limit",
+		});
+
+		expect(saved).toMatchObject({
+			refreshToken: "refresh-new",
+			coolingDownUntil: 400,
+			cooldownReason: "rate-limit",
+		});
 	});
 });

@@ -12,7 +12,11 @@
 // adoptReplacementCredentials(), which the managed router calls when its pool
 // is exhausted and which writes nothing unless a replacement is waiting. An
 // r24-patched file is upgraded in place; the result is byte-identical to
-// patching the unpatched file. Any other layout is refused before a write.
+// patching the unpatched file. r28 also makes the CLI login write
+// (dist/lib/codex-manager/account-pool-write.js) drop the replaced
+// credential's auth-failure cooldown along with its invalidation, so a router
+// restarted right after a login routes the account at once. Any other layout
+// of either file is refused before a write.
 const fs = require("node:fs");
 const path = require("node:path");
 const { spawnSync } = require("node:child_process");
@@ -165,11 +169,30 @@ const sites = [
 ];
 const layouts = ["base", "r24", "r28"];
 
-function convert(source, from, to) {
+// The CLI login write for an account that signs in again. It always dropped
+// the invalidation; r28 drops an auth-failure cooldown with it.
+const loginMarker = "codex-multi-auth r28: a login drops the replaced credential's auth-failure backoff";
+const loginBase = `            enabled: write.preserveEnabledState ? existing.enabled : true,
+            authInvalidatedAt: undefined,
+            authInvalidationErrorCode: undefined,
+            lastUsed: write.now,`;
+const loginReleasing = `            enabled: write.preserveEnabledState ? existing.enabled : true,
+            authInvalidatedAt: undefined,
+            authInvalidationErrorCode: undefined,
+            // ${loginMarker};
+            // every other cooldown is account state and stays.
+            ...(existing.cooldownReason === "auth-failure"
+                ? { coolingDownUntil: undefined, cooldownReason: undefined }
+                : {}),
+            lastUsed: write.now,`;
+const loginSites = [{ base: loginBase, r28: loginReleasing }];
+const loginLayouts = ["base", "r28"];
+
+function convert(source, from, to, table = sites, what = "account persistence") {
   let next = source;
-  for (const site of sites) {
+  for (const site of table) {
     if (next.split(site[from]).length !== 2) {
-      throw new Error(`unsupported account persistence layout for live credential convergence (${from})`);
+      throw new Error(`unsupported ${what} layout for live credential convergence (${from})`);
     }
     next = next.replace(site[from], () => site[to]);
   }
@@ -190,34 +213,61 @@ function render(source, target) {
   return { current, text: convert(base, "base", target) };
 }
 
+// The same for dist/lib/codex-manager/account-pool-write.js (base, r28).
+function renderLoginWrite(source, target) {
+  if (!loginLayouts.includes(target)) throw new Error(`unknown login write layout: ${target}`);
+  const current = source.includes(loginMarker) ? "r28" : "base";
+  const base = convert(source, current, "base", loginSites, "login write");
+  if (base.includes("codex-multi-auth r28:")) throw new Error("incomplete login write patch");
+  return { current, text: convert(base, "base", target, loginSites, "login write") };
+}
+
+// Syntax-check a rendered module before anything is written.
+function assertParses(text, what) {
+  const parsed = spawnSync(process.execPath, ["--input-type=module", "--check"], { input: text, encoding: "utf8" });
+  if (parsed.status !== 0) throw new Error(`invalid patched ${what}: ${parsed.stderr}`);
+}
+
+function replaceFile(file, text) {
+  const temporary = `${file}.${process.pid}.tmp`;
+  try {
+    fs.writeFileSync(temporary, text, { mode: fs.statSync(file).mode & 0o777, flag: "wx" });
+    fs.renameSync(temporary, file);
+  } finally {
+    if (fs.existsSync(temporary)) fs.unlinkSync(temporary);
+  }
+}
+
 function main() {
   const root = process.argv[2];
   const check = process.argv.includes("--check");
   if (!root || !path.isAbsolute(root)) throw new Error("absolute package root required");
   const file = path.join(root, "dist/lib/accounts.js");
+  const loginFile = path.join(root, "dist/lib/codex-manager/account-pool-write.js");
   const original = fs.readFileSync(file, "utf8");
+  const loginOriginal = fs.readFileSync(loginFile, "utf8");
   const { current, text: next } = render(original, "r28");
+  const { current: loginCurrent, text: loginNext } = renderLoginWrite(loginOriginal, "r28");
   if (check && current !== "r28") {
     throw new Error(current === "r24"
       ? "live credential convergence is r24; re-run without --check to upgrade it to r28"
       : "missing live credential convergence patch");
   }
-  if (current === "r28" && next !== original) throw new Error("incomplete live credential convergence patch");
-  const parsed = spawnSync(process.execPath, ["--input-type=module", "--check"], { input: next, encoding: "utf8" });
-  if (parsed.status !== 0) throw new Error(`invalid patched accounts: ${parsed.stderr}`);
-  if (next !== original) {
-    const temporary = `${file}.${process.pid}.tmp`;
-    try {
-      fs.writeFileSync(temporary, next, { mode: fs.statSync(file).mode & 0o777, flag: "wx" });
-      fs.renameSync(temporary, file);
-    } finally {
-      if (fs.existsSync(temporary)) fs.unlinkSync(temporary);
-    }
+  if (check && loginCurrent !== "r28") {
+    throw new Error("missing r28 login write patch; re-run without --check to add it");
   }
-  const outcome = check || current === "r28" ? "verified" : current === "r24" ? "upgraded r24 to r28" : "patched";
+  if (current === "r28" && next !== original) throw new Error("incomplete live credential convergence patch");
+  if (loginCurrent === "r28" && loginNext !== loginOriginal) throw new Error("incomplete login write patch");
+  assertParses(next, "accounts");
+  assertParses(loginNext, "login write");
+  if (next !== original) replaceFile(file, next);
+  if (loginNext !== loginOriginal) replaceFile(loginFile, loginNext);
+  const outcome = check || (current === "r28" && loginCurrent === "r28")
+    ? "verified"
+    : current === "r24" ? "upgraded r24 to r28" : "patched";
   console.log(`Live credential convergence (r28): ${outcome}`);
 }
 
-// Tests require this file to derive the base and r24 layouts of a staged copy.
+// Tests require this file to derive the base, r24 and r28 layouts of a staged copy.
 if (require.main === module) main();
-else module.exports = { render };
+else module.exports = { render, renderLoginWrite };

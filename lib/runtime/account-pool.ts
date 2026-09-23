@@ -163,9 +163,13 @@ export async function persistAccountPoolResults(params: {
 				expiresAt: result.expires,
 				// A new login replaces the invalidated credential, exactly as the
 				// CLI login (buildUpdatedAccount) does; keeping the old marker
-				// would leave the account skipped as token-invalid.
+				// would leave the account skipped as token-invalid. Its
+				// auth-failure backoff goes too; any other cooldown stays.
 				authInvalidatedAt: undefined,
 				authInvalidationErrorCode: undefined,
+				...(existing.cooldownReason === "auth-failure"
+					? { coolingDownUntil: undefined, cooldownReason: undefined }
+					: {}),
 				lastUsed: now,
 				workspaces: mergedWorkspaces,
 				currentWorkspaceIndex: nextCurrentWorkspaceIndex,

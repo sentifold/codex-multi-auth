@@ -203,6 +203,11 @@ export function buildUpdatedAccount(
 			enabled: write.preserveEnabledState ? existing.enabled : true,
 			authInvalidatedAt: undefined,
 			authInvalidationErrorCode: undefined,
+			// The auth-failure backoff belongs to the replaced credential, like
+			// the invalidation. Every other cooldown is account state and stays.
+			...(existing.cooldownReason === "auth-failure"
+				? { coolingDownUntil: undefined, cooldownReason: undefined }
+				: {}),
 			lastUsed: write.now,
 			workspaces: mergedWorkspaces,
 			currentWorkspaceIndex: nextCurrentWorkspaceIndex,

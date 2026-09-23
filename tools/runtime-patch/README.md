@@ -209,14 +209,23 @@ call exactly once, first in that branch.
 
 Both login writes clear the marker on disk: the CLI login
 (`lib/codex-manager/account-pool-write.ts`) always did, and the plugin host
-(`lib/runtime/account-pool.ts`) now does as well. The managed routers and the
-CLI never load the plugin host, so the runtime payloads leave that file alone.
+(`lib/runtime/account-pool.ts`) now does as well. Both also drop an
+`auth-failure` cooldown, which belongs to the replaced credential like the
+marker; every other cooldown stays. Without that, a router restarted right
+after a re-login (before its next save) loaded the old backoff and skipped the
+new credential until it ran out, up to `tokenInvalidationCooldownMs`. The
+payload patches the CLI login write in
+`dist/lib/codex-manager/account-pool-write.js` behind its own r28 marker. The
+managed routers and the CLI never load the plugin host, so the runtime payloads
+leave that file alone.
 
 The payload upgrades an r24-patched `accounts.js` in place, byte-identical to
-patching the unpatched file, and `--check` rejects an r24 file with an explicit
-upgrade message. Any other layout is refused before a write. Required as a
-module, it exports `render(source, layout)` (`base`, `r24`, `r28`) so tests can
-derive each layout from a staged copy. The proxy adoption lives in
+patching the unpatched file, and `--check` rejects an r24 file, or a login
+write without its r28 site, with an explicit message. Any other layout of
+either file is refused before a write. Required as a module, it exports
+`render(source, layout)` (`base`, `r24`, `r28`) and
+`renderLoginWrite(source, layout)` (`base`, `r28`) so tests can derive each
+layout from a staged copy. The proxy adoption lives in
 `payloads/codex-runtime.cjs` behind its own marker, so re-running the patch on
 an older patched proxy adds only that block.
 

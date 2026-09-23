@@ -488,7 +488,9 @@ describe("re-login while an explicit invalidation is resident", () => {
 	}
 
 	// What a login writes: a new refresh token for the same identity with the
-	// invalidation cleared. It leaves the old cooldown fields in place.
+	// invalidation cleared. Logins before r28 (and other clients still) leave
+	// the old auth-failure cooldown in place; the resident manager must release
+	// it either way.
 	function reloginStorage(
 		overrides: Partial<AccountStorageV3["accounts"][number]> = {},
 	): AccountStorageV3 {

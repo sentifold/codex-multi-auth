@@ -212,6 +212,46 @@ describe("account-pool-write helper (issue #512)", () => {
 			]);
 		});
 
+		it("drops the replaced credential's invalidation and auth-failure backoff", () => {
+			// A restart right after the login loads this record: an old
+			// auth-failure backoff would bench the new credential until it ran out.
+			const invalidated: AccountMetadataV3 = {
+				...existing,
+				authInvalidatedAt: NOW - 60_000,
+				authInvalidationErrorCode: "token_invalidated",
+				coolingDownUntil: NOW + 300_000,
+				cooldownReason: "auth-failure",
+				rateLimitResetTimes: { "gpt-5.2:gpt-6-astra": NOW + 86_400_000 },
+			};
+			const { account } = buildUpdatedAccount(invalidated, write());
+			expect(account.refreshToken).toBe("refresh-new");
+			for (const field of [
+				"authInvalidatedAt",
+				"authInvalidationErrorCode",
+				"coolingDownUntil",
+				"cooldownReason",
+			] as const) {
+				expect(account[field]).toBeUndefined();
+			}
+			expect(account.rateLimitResetTimes).toEqual({
+				"gpt-5.2:gpt-6-astra": NOW + 86_400_000,
+			});
+		});
+
+		it.each(["rate-limit", "server-error", "network-error"] as const)(
+			"keeps a %s cooldown, which is account state",
+			(cooldownReason) => {
+				const cooling: AccountMetadataV3 = {
+					...existing,
+					coolingDownUntil: NOW + 300_000,
+					cooldownReason,
+				};
+				const { account } = buildUpdatedAccount(cooling, write());
+				expect(account.coolingDownUntil).toBe(NOW + 300_000);
+				expect(account.cooldownReason).toBe(cooldownReason);
+			},
+		);
+
 		it("does not invent workspace tracking when the login returned none", () => {
 			const bare: AccountMetadataV3 = { ...existing, workspaces: undefined };
 			const { account, outcome } = buildUpdatedAccount(
