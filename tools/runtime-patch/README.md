@@ -239,6 +239,14 @@ writes the old invalidation back onto the new refresh token, where r28 has to
 keep it. Unbind it, or bind it again from the patched package (`unbind-app`,
 then `bind-app`; `bind-app` alone keeps a running router).
 
+LiveAccountSync, the store watcher, cannot bring a stale marker back. Only the
+plugin host (`dist/index.js`) starts it; the managed machine router
+(`startRuntimeRotationProxy` with `managedMachineRouter`) and
+`scripts/codex-app-router.js` never watch the store. On a change it replaces
+the plugin host's AccountManager with one loaded from disk, so the login's
+unmarked record wins outright, and a save still pending in the replaced
+manager goes through the same reconcile as every other save.
+
 
 ### r25: opt-in subscription final-week preference
 

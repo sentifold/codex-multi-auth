@@ -705,6 +705,47 @@ describe("re-login while an explicit invalidation is resident", () => {
 		expect(manager.getAccountRuntimeSkipReason(0, FAMILY, MODEL)).toBeNull();
 	});
 
+	it("adopts the store after persisting a refresh it cannot resolve to a live account", async () => {
+		const stored = storageWith(FRESH_EXPIRES);
+		const second = {
+			...stored.accounts[0]!,
+			accountId: "acc_2",
+			email: "account-2@example.com",
+			refreshToken: "refresh-2",
+			accessToken: "access-2",
+			expiresAt: STALE_EXPIRES,
+		};
+		stored.accounts.push(second);
+		const manager = new AccountManager(undefined, stored);
+		openManagers.push(manager);
+		const invalidated = manager.getAccountByIndex(0)!;
+		manager.markAuthInvalidated(invalidated, "token_invalidated", INVALIDATED_AT);
+		// acc_1 signed in again; another process rotated acc_2's credential.
+		const relogin = reloginStorage();
+		relogin.accounts.push({
+			...second,
+			refreshToken: "refresh-2-rotated",
+			accessToken: "access-2-rotated",
+			expiresAt: NOW + 5_400_000,
+		});
+		const disk = statefulDisk(relogin);
+
+		// A refresh of acc_2's rotated credential, which the live pool does not hold.
+		const committed = await manager.commitRefreshedAuth(
+			{ refreshToken: "refresh-2-rotated" },
+			{ type: "oauth", access: "access-2-new", refresh: "refresh-2-new", expires: NOW + 7_200_000 },
+		);
+
+		expect(committed).toBeNull();
+		expect(disk.current.accounts[1]).toMatchObject({ refreshToken: "refresh-2-new" });
+		expect(manager.getAccountByIndex(1)).toMatchObject({
+			refreshToken: "refresh-2-new",
+			access: "access-2-new",
+		});
+		expect(invalidated.refreshToken).toBe("refresh-relogin");
+		expect(manager.getAccountRuntimeSkipReason(0, FAMILY, MODEL)).toBeNull();
+	});
+
 	// A managed router whose whole pool is unavailable makes no routine saves,
 	// so it asks for a waiting replacement directly before refusing a request.
 	describe("adoptReplacementCredentials", () => {
