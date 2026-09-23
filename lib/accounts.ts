@@ -1564,8 +1564,9 @@ export class AccountManager {
 	 * auth reasons (an explicit invalidation or an active auth-failure
 	 * cooldown) and the store holds its replacement (a different refresh
 	 * token with a later expiry, not itself invalidated), run the reconciling
-	 * save, which releases and adopts it. Nothing is written otherwise.
-	 * Returns the indexes of the accounts no longer blocked for auth reasons.
+	 * save, which releases and adopts it. Nothing is written otherwise, nor
+	 * when the store's accounts differ from the live pool. Returns the
+	 * indexes of the accounts no longer blocked for auth reasons.
 	 */
 	async adoptReplacementCredentials(): Promise<number[]> {
 		const blockedForAuth = () =>
@@ -1596,6 +1597,19 @@ export class AccountManager {
 					);
 				});
 				if (!replacementWaiting) return [];
+				// The write is rebuilt from the live pool: it would drop an account
+				// another process added to the store, or bring back one it removed.
+				// Leave a changed pool to a restart, which loads it from disk.
+				const liveKeys = new Set(
+					this.accounts.map((account) => getAccountIdentityKey(account)),
+				);
+				const samePool =
+					current.accounts.length === this.accounts.length &&
+					current.accounts.every((diskAccount) => {
+						const key = getAccountIdentityKey(diskAccount);
+						return key !== undefined && liveKeys.has(key);
+					});
+				if (!samePool) return [];
 				const snapshot = this.reconcileTokensFromDisk(
 					this.buildStorageSnapshot(),
 					current,

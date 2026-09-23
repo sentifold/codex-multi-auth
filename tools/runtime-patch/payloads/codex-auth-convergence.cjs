@@ -66,7 +66,8 @@ const r28Methods = `    // ${r28Marker}
     }
     // A managed router whose whole pool is unavailable makes no saves. Adopt a
     // waiting replacement of a credential blocked for auth reasons directly;
-    // nothing is written unless one is waiting. Returns the released indexes.
+    // nothing is written unless one is waiting, nor when the store's accounts
+    // differ from the live pool. Returns the released indexes.
     async adoptReplacementCredentials() {
         const blockedForAuth = () => this.accounts.filter((account) => this.isAccountAuthInvalidated(account) ||
             (account.cooldownReason === "auth-failure" &&
@@ -92,6 +93,17 @@ const r28Methods = `    // ${r28Marker}
                     !this.isAccountAuthInvalidated(disk));
             });
             if (!replacementWaiting)
+                return [];
+            // The write is rebuilt from the live pool: it would drop an account
+            // another process added to the store, or bring back one it removed.
+            // Leave a changed pool to a restart, which loads it from disk.
+            const liveKeys = new Set(this.accounts.map((account) => getAccountIdentityKey(account)));
+            const samePool = current.accounts.length === this.accounts.length &&
+                current.accounts.every((diskAccount) => {
+                    const key = getAccountIdentityKey(diskAccount);
+                    return key !== undefined && liveKeys.has(key);
+                });
+            if (!samePool)
                 return [];
             const snapshot = this.reconcileTokensFromDisk(this.buildStorageSnapshot(), current);
             await persist(snapshot);

@@ -195,9 +195,13 @@ would wait for a restart. `AccountManager.adoptReplacementCredentials()` covers
 that case. When an account is blocked for auth reasons (an explicit
 invalidation or an active `auth-failure` cooldown) and the store holds its
 replacement under the rule above, it runs the same reconciling save and
-returns the released account indexes; otherwise it writes nothing. The runtime
-proxy payload calls it in the managed no-account branch before the pool wait
-or the 503: once per request, only while a candidate is skipped as
+returns the released account indexes; otherwise it writes nothing. It also
+writes nothing when the store's accounts differ from the live pool (an account
+added or removed since the router loaded it): that save is rebuilt from the
+live pool and would drop or bring back an account, so a changed pool waits for
+a restart. The runtime proxy payload calls it in the managed no-account branch
+before the pool wait or the 503: once per request, only while a candidate is
+skipped as
 `token-invalid` or `cooling-down:auth-failure`, and at most once a second per
 router, with concurrent requests sharing one pass. A released account is
 selectable again in the same request. `payloads/check-proxy.cjs` requires that

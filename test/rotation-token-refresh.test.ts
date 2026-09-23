@@ -783,6 +783,48 @@ describe("re-login while an explicit invalidation is resident", () => {
 			expect(manager.getAccountRuntimeSkipReason(0, FAMILY, MODEL)).toBe(AUTH_INVALIDATION_MARKER);
 		});
 
+		it("writes nothing when another process added an account to the store", async () => {
+			const { manager, account } = invalidatedManager();
+			const stored = reloginStorage();
+			stored.accounts.push({
+				...stored.accounts[0]!,
+				accountId: "acc_added",
+				email: "added@example.com",
+				refreshToken: "refresh-added",
+				accessToken: "access-added",
+			});
+			const disk = countingDisk(stored);
+
+			await expect(manager.adoptReplacementCredentials()).resolves.toEqual([]);
+
+			// A write rebuilt from the live pool would drop the added account.
+			expect(disk.writes).toBe(0);
+			expect(disk.current.accounts.map((entry) => entry.accountId)).toEqual(["acc_1", "acc_added"]);
+			expect(manager.getAccountRuntimeSkipReason(0, FAMILY, MODEL)).toBe(AUTH_INVALIDATION_MARKER);
+			expect(account.refreshToken).toBe("refresh-1");
+		});
+
+		it("writes nothing when another process removed an account from the store", async () => {
+			const stored = storageWith(FRESH_EXPIRES);
+			stored.accounts.push({
+				...stored.accounts[0]!,
+				accountId: "acc_removed",
+				email: "removed@example.com",
+				refreshToken: "refresh-removed",
+				accessToken: "access-removed",
+			});
+			const manager = new AccountManager(undefined, stored);
+			openManagers.push(manager);
+			manager.markAuthInvalidated(manager.getAccountByIndex(0)!, "token_invalidated", INVALIDATED_AT);
+			const disk = countingDisk(reloginStorage());
+
+			await expect(manager.adoptReplacementCredentials()).resolves.toEqual([]);
+
+			// A write rebuilt from the live pool would bring the removed account back.
+			expect(disk.writes).toBe(0);
+			expect(manager.getAccountRuntimeSkipReason(0, FAMILY, MODEL)).toBe(AUTH_INVALIDATION_MARKER);
+		});
+
 		it("does not open the store while no account is blocked for auth reasons", async () => {
 			const manager = managerWith(FRESH_EXPIRES);
 			const account = refreshParams(manager).account;
