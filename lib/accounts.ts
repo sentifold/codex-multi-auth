@@ -1506,7 +1506,9 @@ export class AccountManager {
 	 * Switching to a different refresh token mirrors the record just persisted:
 	 * unless that record is itself invalidated, the old credential's explicit
 	 * invalidation, auth-failure cooldown and failure count go with it, so a
-	 * re-login is routable again without restarting the resident router.
+	 * re-login is routable again after the resident router's next save, with
+	 * no restart. A router that cannot route makes no saves; it calls
+	 * adoptReplacementCredentials instead.
 	 */
 	private adoptPersistedTokens(snapshot: AccountStorageV3): void {
 		const storedByIdentity = new Map(
@@ -1553,6 +1555,59 @@ export class AccountManager {
 			delete account.coolingDownUntil;
 			delete account.cooldownReason;
 		}
+	}
+
+	/**
+	 * A resident manager meets a re-login only when it saves, and a managed
+	 * router whose whole pool is unavailable makes no saves, so without this
+	 * the re-login would wait for a restart. When an account is blocked for
+	 * auth reasons (an explicit invalidation or an active auth-failure
+	 * cooldown) and the store holds its replacement (a different refresh
+	 * token with a later expiry, not itself invalidated), run the reconciling
+	 * save, which releases and adopts it. Nothing is written otherwise.
+	 * Returns the indexes of the accounts no longer blocked for auth reasons.
+	 */
+	async adoptReplacementCredentials(): Promise<number[]> {
+		const blockedForAuth = () =>
+			this.accounts.filter(
+				(account) =>
+					this.isAccountAuthInvalidated(account) ||
+					(account.cooldownReason === "auth-failure" &&
+						this.isAccountCoolingDown(account)),
+			);
+		if (blockedForAuth().length === 0) return [];
+		return runWithStoragePathState(this.storagePathState, () =>
+			withAccountStorageTransaction(async (current, persist) => {
+				if (!current || !Array.isArray(current.accounts)) return [];
+				const blocked = blockedForAuth();
+				const diskByIdentity = new Map<string, (typeof current.accounts)[number]>();
+				for (const diskAccount of current.accounts) {
+					const key = getAccountIdentityKey(diskAccount);
+					if (key) diskByIdentity.set(key, diskAccount);
+				}
+				const replacementWaiting = blocked.some((account) => {
+					const key = getAccountIdentityKey(account);
+					const disk = key ? diskByIdentity.get(key) : undefined;
+					return (
+						!!disk?.refreshToken &&
+						disk.refreshToken !== account.refreshToken &&
+						(disk.expiresAt ?? 0) > (account.expires ?? 0) &&
+						!this.isAccountAuthInvalidated(disk)
+					);
+				});
+				if (!replacementWaiting) return [];
+				const snapshot = this.reconcileTokensFromDisk(
+					this.buildStorageSnapshot(),
+					current,
+				);
+				await persist(snapshot);
+				this.adoptPersistedTokens(snapshot);
+				const stillBlocked = new Set(blockedForAuth());
+				return blocked
+					.filter((account) => !stillBlocked.has(account))
+					.map((account) => account.index);
+			}),
+		);
 	}
 
 	private buildStorageSnapshot(): AccountStorageV3 {

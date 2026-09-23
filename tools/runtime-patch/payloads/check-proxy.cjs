@@ -14,6 +14,11 @@ const required = [
   "codex-multi-auth r10 policy: sanitize terminal pool exhaustion as retryable 503",
   "codex-multi-auth r16 policy: never persist advisory quota deferrals as rate limits",
   "codex-multi-auth r23 policy: honor per-request service tier",
+  "codex-multi-auth r28 policy: adopt a re-login before refusing an exhausted pool",
+  "async function adoptManagedReplacementCredentials(state, accountManager) {",
+  'typeof accountManager.adoptReplacementCredentials !== "function"',
+  "        let managedReplacementAdoptionTried = false;",
+  "                        const releasedIndexes = await adoptManagedReplacementCredentials(",
   'function managedServiceTierWireValue(parsedBody) {',
   'switch (parsedBody?.service_tier)',
   'case "default": return "default";',
@@ -98,6 +103,15 @@ const exactRoutingSnippetCounts = new Map([
 ]);
 for (const [snippet, expectedCount] of exactRoutingSnippetCounts) {
   if (source.split(snippet).length - 1 !== expectedCount) process.exit(1);
+}
+const replacementAdoptionMarker =
+  "codex-multi-auth r28 policy: adopt a re-login before refusing an exhausted pool";
+if (source.split(replacementAdoptionMarker).length - 1 !== 2 ||
+    source.split(
+      "                if (state.managedMachineRouter) {\n" +
+      `                    // ${replacementAdoptionMarker}.\n`,
+    ).length - 1 !== 1) {
+  process.exit(1);
 }
 const preHeaderRelease = source.indexOf(
   "            // Admission bounds only token refresh and the pre-header fetch.\n" +

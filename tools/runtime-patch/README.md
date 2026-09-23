@@ -152,9 +152,11 @@ The post-write expiry check protects newer concurrent refreshes. Failed writes
 do not publish a new in-memory credential state.
 
 This does not reload the pool or reset quota, pause, pin, cooldown, invalidation,
-or request model/tier. An existing auth cooldown expires normally (usually 30s).
-Explicit revocation still requires the existing recovery/login path. This closes
-the stale-memory failure; it cannot prevent real upstream outages or spent quota.
+or request model/tier, except that since r28 a replaced credential's
+invalidation and auth-failure cooldown go with it (below). An existing auth
+cooldown expires normally (usually 30s). Explicit revocation still requires the
+existing recovery/login path. This closes the stale-memory failure; it cannot
+prevent real upstream outages or spent quota.
 
 `payloads/codex-auth-convergence.cjs` ports the source fix to pinned npm 2.9.1.
 Its byte-identical dotfiles copy is `.bin/lib/codex-auth-convergence.cjs`.
@@ -186,11 +188,28 @@ affinity. A marker already written back for the current refresh token looks
 exactly like a real invalidation, so r28 keeps it; a new login (a new refresh
 token) or the manual repair clears it.
 
+The release happens when the resident manager saves, and a managed machine
+router whose whole pool is unavailable makes no saves: its no-account branch
+never reaches upstream's stale-state reload, so a re-login during a full outage
+would wait for a restart. `AccountManager.adoptReplacementCredentials()` covers
+that case. When an account is blocked for auth reasons (an explicit
+invalidation or an active `auth-failure` cooldown) and the store holds its
+replacement under the rule above, it runs the same reconciling save and
+returns the released account indexes; otherwise it writes nothing. The runtime
+proxy payload calls it in the managed no-account branch before the pool wait
+or the 503: once per request, only while a candidate is skipped as
+`token-invalid` or `cooling-down:auth-failure`, and at most once a second per
+router, with concurrent requests sharing one pass. A released account is
+selectable again in the same request. `payloads/check-proxy.cjs` requires that
+call exactly once, first in that branch.
+
 The payload upgrades an r24-patched `accounts.js` in place, byte-identical to
 patching the unpatched file, and `--check` rejects an r24 file with an explicit
 upgrade message. Any other layout is refused before a write. Required as a
 module, it exports `render(source, layout)` (`base`, `r24`, `r28`) so tests can
-derive each layout from a staged copy.
+derive each layout from a staged copy. The proxy adoption lives in
+`payloads/codex-runtime.cjs` behind its own marker, so re-running the patch on
+an older patched proxy adds only that block.
 
 
 ### r25: opt-in subscription final-week preference

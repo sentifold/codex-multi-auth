@@ -8,9 +8,11 @@
 // r24 made a resident AccountManager adopt newer persisted credentials. r28
 // also drops the explicit invalidation and auth-failure cooldown a replaced
 // credential earned, in the persisted record and the live account, so a
-// re-login is routable again without a restart. An r24-patched file is
-// upgraded in place; the result is byte-identical to patching the unpatched
-// file. Any other layout is refused before a write.
+// re-login is routable again without a restart: at the next save, or through
+// adoptReplacementCredentials(), which the managed router calls when its pool
+// is exhausted and which writes nothing unless a replacement is waiting. An
+// r24-patched file is upgraded in place; the result is byte-identical to
+// patching the unpatched file. Any other layout is refused before a write.
 const fs = require("node:fs");
 const path = require("node:path");
 const { spawnSync } = require("node:child_process");
@@ -61,6 +63,44 @@ const r28Methods = `    // ${r28Marker}
             delete account.coolingDownUntil;
             delete account.cooldownReason;
         }
+    }
+    // A managed router whose whole pool is unavailable makes no saves. Adopt a
+    // waiting replacement of a credential blocked for auth reasons directly;
+    // nothing is written unless one is waiting. Returns the released indexes.
+    async adoptReplacementCredentials() {
+        const blockedForAuth = () => this.accounts.filter((account) => this.isAccountAuthInvalidated(account) ||
+            (account.cooldownReason === "auth-failure" &&
+                this.isAccountCoolingDown(account)));
+        if (blockedForAuth().length === 0)
+            return [];
+        return runWithStoragePathState(this.storagePathState, () => withAccountStorageTransaction(async (current, persist) => {
+            if (!current || !Array.isArray(current.accounts))
+                return [];
+            const blocked = blockedForAuth();
+            const diskByIdentity = new Map();
+            for (const diskAccount of current.accounts) {
+                const key = getAccountIdentityKey(diskAccount);
+                if (key)
+                    diskByIdentity.set(key, diskAccount);
+            }
+            const replacementWaiting = blocked.some((account) => {
+                const key = getAccountIdentityKey(account);
+                const disk = key ? diskByIdentity.get(key) : undefined;
+                return (!!disk?.refreshToken &&
+                    disk.refreshToken !== account.refreshToken &&
+                    (disk.expiresAt ?? 0) > (account.expires ?? 0) &&
+                    !this.isAccountAuthInvalidated(disk));
+            });
+            if (!replacementWaiting)
+                return [];
+            const snapshot = this.reconcileTokensFromDisk(this.buildStorageSnapshot(), current);
+            await persist(snapshot);
+            this.adoptPersistedTokens(snapshot);
+            const stillBlocked = new Set(blockedForAuth());
+            return blocked
+                .filter((account) => !stillBlocked.has(account))
+                .map((account) => account.index);
+        }));
     }
 `;
 const saveBase = `                await persist(this.reconcileTokensFromDisk(this.buildStorageSnapshot(), current));`;
@@ -131,6 +171,7 @@ function render(source, target) {
   const current = source.includes(r28Marker) ? "r28" : source.includes(r24Marker) ? "r24" : "base";
   const base = convert(source, current, "base");
   if (base.includes("adoptPersistedTokens(") || base.includes("releaseReplacedCredentialAuthState(") ||
+      base.includes("adoptReplacementCredentials(") ||
       base.includes("codex-multi-auth r24:") || base.includes("codex-multi-auth r28:")) {
     throw new Error("incomplete live credential convergence patch");
   }

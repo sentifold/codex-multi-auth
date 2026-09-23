@@ -641,6 +641,29 @@ describe("re-login while an explicit invalidation is resident", () => {
 		expect(manager.getAccountRuntimeSkipReason(0, FAMILY, MODEL)).toBeNull();
 	});
 
+	it("keeps a marker the same credential earns while the write is in flight", async () => {
+		const manager = managerWith(FRESH_EXPIRES);
+		const account = refreshParams(manager).account;
+		// Disk holds the same refresh token with a later expiry and no marker.
+		withAccountStorageTransactionMock.mockImplementation(async (handler) =>
+			handler(storageWith(RELOGIN_EXPIRES, { accessToken: "access-topped-up" }), async () => {
+				manager.markAuthInvalidated(account, "token_invalidated", NOW);
+				applyMonotonicAuthCooldown(manager, account, INVALIDATION_COOLDOWN_MS);
+			}),
+		);
+
+		await manager.saveToDisk();
+
+		expect(account).toMatchObject({
+			refreshToken: "refresh-1",
+			access: "access-topped-up",
+			authInvalidatedAt: NOW,
+			authInvalidationErrorCode: "token_invalidated",
+			cooldownReason: "auth-failure",
+		});
+		expect(manager.getAccountRuntimeSkipReason(0, FAMILY, MODEL)).toBe(AUTH_INVALIDATION_MARKER);
+	});
+
 	it("does not let another account's refresh revert the re-login on disk", async () => {
 		const stored = storageWith(FRESH_EXPIRES);
 		const second = {
@@ -678,5 +701,117 @@ describe("re-login while an explicit invalidation is resident", () => {
 		expect(disk.current.accounts[1]).toMatchObject({ refreshToken: "refresh-2-new", accessToken: "access-2-new" });
 		expect(invalidated.refreshToken).toBe("refresh-relogin");
 		expect(manager.getAccountRuntimeSkipReason(0, FAMILY, MODEL)).toBeNull();
+	});
+
+	// A managed router whose whole pool is unavailable makes no routine saves,
+	// so it asks for a waiting replacement directly before refusing a request.
+	describe("adoptReplacementCredentials", () => {
+		function countingDisk(initial: AccountStorageV3) {
+			const disk = { current: structuredClone(initial), writes: 0 };
+			withAccountStorageTransactionMock.mockImplementation(async (handler) =>
+				handler(structuredClone(disk.current), async (storage: AccountStorageV3) => {
+					disk.writes += 1;
+					disk.current = structuredClone(storage);
+				}),
+			);
+			return disk;
+		}
+
+		it("adopts a waiting re-login without a routine save", async () => {
+			const { manager, account } = invalidatedManager();
+			const disk = countingDisk(reloginStorage());
+
+			await expect(manager.adoptReplacementCredentials()).resolves.toEqual([0]);
+
+			expect(disk.writes).toBe(1);
+			expect(manager.getAccountByIndex(0)).toBe(account);
+			expect(account).toMatchObject({
+				refreshToken: "refresh-relogin",
+				access: "access-relogin",
+				expires: RELOGIN_EXPIRES,
+				consecutiveAuthFailures: 0,
+			});
+			expect(account.authInvalidatedAt).toBeUndefined();
+			expect(account.cooldownReason).toBeUndefined();
+			expect(manager.getAccountRuntimeSkipReason(0, FAMILY, MODEL)).toBeNull();
+			const persisted = disk.current.accounts[0];
+			for (const field of ["authInvalidatedAt", "authInvalidationErrorCode", "coolingDownUntil", "cooldownReason"] as const) {
+				expect(persisted?.[field]).toBeUndefined();
+			}
+			// Nothing is left to adopt, so a second call neither loads nor writes.
+			await expect(manager.adoptReplacementCredentials()).resolves.toEqual([]);
+			expect(withAccountStorageTransactionMock).toHaveBeenCalledTimes(1);
+			expect(disk.writes).toBe(1);
+		});
+
+		it("releases an auth-failure cooldown that has no explicit invalidation", async () => {
+			const manager = managerWith(FRESH_EXPIRES);
+			const account = refreshParams(manager).account;
+			applyMonotonicAuthCooldown(manager, account, DEFAULT_AUTH_FAILURE_COOLDOWN_MS);
+			expect(manager.getAccountRuntimeSkipReason(0, FAMILY, MODEL)).toBe("cooling-down:auth-failure");
+			const disk = countingDisk(reloginStorage({ coolingDownUntil: undefined, cooldownReason: undefined }));
+
+			await expect(manager.adoptReplacementCredentials()).resolves.toEqual([0]);
+
+			expect(disk.writes).toBe(1);
+			expect(account.refreshToken).toBe("refresh-relogin");
+			expect(manager.getAccountRuntimeSkipReason(0, FAMILY, MODEL)).toBeNull();
+		});
+
+		it.each([
+			["the same refresh token", storageWith(RELOGIN_EXPIRES, { accessToken: "access-topped-up" })],
+			["a different token that does not expire later", storageWith(FRESH_EXPIRES - 1_000, {
+				accessToken: "access-relogin",
+				refreshToken: "refresh-relogin",
+			})],
+			["a disk record that is itself invalidated", storageWith(RELOGIN_EXPIRES, {
+				accessToken: "access-relogin",
+				refreshToken: "refresh-relogin",
+				authInvalidatedAt: NOW - 1_000,
+				authInvalidationErrorCode: "token_revoked",
+			})],
+		])("writes and releases nothing for %s", async (_label, stored) => {
+			const { manager, account } = invalidatedManager();
+			const before = structuredClone(account);
+			const disk = countingDisk(stored);
+
+			await expect(manager.adoptReplacementCredentials()).resolves.toEqual([]);
+
+			expect(withAccountStorageTransactionMock).toHaveBeenCalledTimes(1);
+			expect(disk.writes).toBe(0);
+			expect(account).toEqual(before);
+			expect(manager.getAccountRuntimeSkipReason(0, FAMILY, MODEL)).toBe(AUTH_INVALIDATION_MARKER);
+		});
+
+		it("does not open the store while no account is blocked for auth reasons", async () => {
+			const manager = managerWith(FRESH_EXPIRES);
+			const account = refreshParams(manager).account;
+			// A newer credential is waiting, but rate limits are account state.
+			manager.markAccountCoolingDown(account, 120_000, "rate-limit");
+			manager.markRateLimited(account, 86_400_000, FAMILY, MODEL);
+			const disk = countingDisk(reloginStorage({ coolingDownUntil: undefined, cooldownReason: undefined }));
+
+			await expect(manager.adoptReplacementCredentials()).resolves.toEqual([]);
+
+			expect(withAccountStorageTransactionMock).not.toHaveBeenCalled();
+			expect(disk.writes).toBe(0);
+			expect(account.refreshToken).toBe("refresh-1");
+			expect(account.cooldownReason).toBe("rate-limit");
+		});
+
+		it("releases nothing when the write fails", async () => {
+			const { manager, account } = invalidatedManager();
+			const before = structuredClone(account);
+			withAccountStorageTransactionMock.mockImplementation(async (handler) =>
+				handler(reloginStorage(), async () => {
+					throw new Error("disk full");
+				}),
+			);
+
+			await expect(manager.adoptReplacementCredentials()).rejects.toThrow("disk full");
+
+			expect(account).toEqual(before);
+			expect(manager.getAccountRuntimeSkipReason(0, FAMILY, MODEL)).toBe(AUTH_INVALIDATION_MARKER);
+		});
 	});
 });

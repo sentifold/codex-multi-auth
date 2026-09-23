@@ -13,6 +13,8 @@ const standardTierMarker = "codex-multi-auth r14 policy: force Standard service 
 const standardRoutingHintMarker = "codex-multi-auth r14 policy: bind canonical Standard routing hint to exact model";
 const standardNonResponsesRoutingHintMarker = "codex-multi-auth r14 policy: strip managed routing hint from non-Responses requests";
 const clientTierMarker = "codex-multi-auth r23 policy: honor per-request service tier";
+const replacementAdoptionMarker =
+  "codex-multi-auth r28 policy: adopt a re-login before refusing an exhausted pool";
 const managedTierMarker = "codex-multi-auth r15 policy: enforce machine-local service tier";
 const managedRoutingHintMarker = "codex-multi-auth r15 policy: bind canonical machine-local routing hint";
 const managedNonResponsesRoutingHintMarker = "codex-multi-auth r15 policy: strip managed routing hint from non-Responses requests";
@@ -2282,6 +2284,86 @@ if (!source.includes(clientTierMarker)) {
   }
 }
 
+// A re-login during a full outage: the managed no-account branch breaks
+// before upstream's stale-state reload, so the managed router never reloads
+// its pool, and a pool that cannot route makes no saves. The r28 release of a
+// replaced credential would then wait for a restart. Before refusing a
+// request, once per request, at most once a second per router and only while
+// a candidate is skipped for auth reasons, ask the resident manager to adopt
+// a waiting replacement. It writes nothing unless one is waiting; a released
+// account is selectable again for the same request.
+if (!source.includes(replacementAdoptionMarker)) {
+  const replaceAdoptionHunk = (needle, replacement, what) => {
+    const start = source.indexOf(needle);
+    if (start < 0 || source.indexOf(needle, start + needle.length) >= 0) {
+      throw new Error(
+        `unsupported codex-multi-auth ${what} layout; refusing an unsafe patch`,
+      );
+    }
+    source = source.slice(0, start) + replacement + source.slice(start + needle.length);
+  };
+
+  const poolWaitHelperNeedle = "async function waitForManagedPoolIfReady(params) {";
+  replaceAdoptionHunk(poolWaitHelperNeedle, [
+    `// ${replacementAdoptionMarker}.`,
+    "// A pool that cannot route makes no saves, and the managed router never",
+    "// reloads it, so an account signed in again during a full outage would stay",
+    "// skipped until a restart. Ask the resident manager to adopt a waiting",
+    "// replacement instead: at most once a second per router, sharing one pass",
+    "// between concurrent requests. It writes nothing unless one is waiting.",
+    "const MANAGED_REPLACEMENT_ADOPTION_INTERVAL_MS = 1_000;",
+    "function isManagedAuthSkipReason(reason) {",
+    '    return reason === AUTH_INVALIDATION_MARKER || reason === "cooling-down:auth-failure";',
+    "}",
+    "async function adoptManagedReplacementCredentials(state, accountManager) {",
+    '    if (typeof accountManager.adoptReplacementCredentials !== "function") return [];',
+    "    if (state.managedReplacementAdoption) return state.managedReplacementAdoption;",
+    "    const startedAt = Date.now();",
+    "    if (startedAt - (state.managedReplacementAdoptionAt ?? 0) <",
+    "        MANAGED_REPLACEMENT_ADOPTION_INTERVAL_MS) return [];",
+    "    state.managedReplacementAdoptionAt = startedAt;",
+    "    state.managedReplacementAdoption = accountManager.adoptReplacementCredentials()",
+    "        .catch((error) => {",
+    "            state.status.lastError = error instanceof Error ? error.message : String(error);",
+    "            return [];",
+    "        })",
+    "        .finally(() => {",
+    "            state.managedReplacementAdoption = null;",
+    "        });",
+    "    return state.managedReplacementAdoption;",
+    "}",
+    poolWaitHelperNeedle,
+  ].join("\n"), "managed pool wait helper");
+
+  const adoptionStateNeedle = "        let managedPoolWaitRounds = 0;\n";
+  replaceAdoptionHunk(adoptionStateNeedle, adoptionStateNeedle +
+    "        let managedReplacementAdoptionTried = false;\n", "managed retry-loop state");
+
+  const managedNoAccountNeedle = [
+    "                if (state.managedMachineRouter) {",
+    "                    const waitedForPool = await waitForManagedPoolIfReady({",
+  ].join("\n");
+  replaceAdoptionHunk(managedNoAccountNeedle, [
+    "                if (state.managedMachineRouter) {",
+    `                    // ${replacementAdoptionMarker}.`,
+    "                    if (!managedReplacementAdoptionTried &&",
+    "                        [...accountSkipReasons.values()].some(isManagedAuthSkipReason)) {",
+    "                        managedReplacementAdoptionTried = true;",
+    "                        const releasedIndexes = await adoptManagedReplacementCredentials(",
+    "                            state, accountManager);",
+    "                        if (managedLifecycle.signal.aborted) return;",
+    "                        if (releasedIndexes.length > 0) {",
+    "                            for (const index of releasedIndexes) {",
+    "                                attemptedIndexes.delete(index);",
+    "                                accountSkipReasons.delete(index);",
+    "                            }",
+    "                            continue;",
+    "                        }",
+    "                    }",
+    "                    const waitedForPool = await waitForManagedPoolIfReady({",
+  ].join("\n"), "managed no-account branch");
+}
+
 const requiredSnippets = [
   identityMarker,
   rotationMarker,
@@ -2296,6 +2378,11 @@ const requiredSnippets = [
   terminalExhaustionMarker,
   poolStatusMarker,
   advisoryQuotaMarker,
+  replacementAdoptionMarker,
+  "async function adoptManagedReplacementCredentials(state, accountManager) {",
+  'typeof accountManager.adoptReplacementCredentials !== "function"',
+  "        let managedReplacementAdoptionTried = false;",
+  "                        const releasedIndexes = await adoptManagedReplacementCredentials(",
   "codex-multi-auth r23 policy: honor per-request service tier",
   'function managedServiceTierWireValue(parsedBody) {',
   'switch (parsedBody?.service_tier)',
@@ -2389,6 +2476,14 @@ for (const [snippet, expectedCount] of exactRoutingSnippetCounts) {
   if (source.split(snippet).length - 1 !== expectedCount) {
     throw new Error("Codex managed routing-hint normalization is duplicated or incomplete");
   }
+}
+// The r28 re-login adoption runs first in the managed no-account branch, once.
+if (source.split(replacementAdoptionMarker).length - 1 !== 2 ||
+    source.split(
+      "                if (state.managedMachineRouter) {\n" +
+      `                    // ${replacementAdoptionMarker}.\n`,
+    ).length - 1 !== 1) {
+  throw new Error("codex-multi-auth r28 re-login adoption is duplicated or misplaced");
 }
 const preHeaderRelease = source.indexOf(
   "            // Admission bounds only token refresh and the pre-header fetch.\n" +
