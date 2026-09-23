@@ -247,6 +247,30 @@ the plugin host's AccountManager with one loaded from disk, so the login's
 unmarked record wins outright, and a save still pending in the replaced
 manager goes through the same reconcile as every other save.
 
+### r31: a replaced credential keeps its late failures
+
+r28 left two ways for the old credential to fail the new one after a re-login
+was adopted, both older than r28 (r24):
+
+- **Late 401.** A request sent with the old credential is still in flight when
+  the resident manager adopts the re-login. Its 401 used to invalidate the new
+  credential and back it off. The proxy payload now compares the token the
+  request carried (`refreshed.accessToken`) with the account's current one; when
+  they differ it marks nothing and retries the request on the current
+  credential. A 401 of the current credential still invalidates it.
+  `payloads/codex-runtime.cjs` carries this behind its own r31 marker, first in
+  the upstream 401 branch, and `payloads/check-proxy.cjs` requires it there.
+- **Late refresh failure.** A token refresh of the old credential that fails
+  after the re-login was adopted marks nothing and evaluates the account's
+  current credential instead, once (`lib/runtime/rotation-token-refresh.ts`).
+  The convergence payload patches `dist/lib/runtime/rotation-token-refresh.js`
+  behind its own r31 marker; `--check` rejects a stage without it, and
+  `renderRefreshFailure(source, layout)` (`base`, `r31`) derives both layouts.
+
+The same revision floors the pool-exhaustion 503's `retry_after_ms` at 1 ms.
+`Retry-After` was already at least one second, but the body said 0 whenever
+every cooldown had lapsed before the refusal was written.
+
 
 ### r25: opt-in subscription final-week preference
 

@@ -19,6 +19,10 @@ const required = [
   'typeof accountManager.adoptReplacementCredentials !== "function"',
   "        let managedReplacementAdoptionTried = false;",
   "                        const releasedIndexes = await adoptManagedReplacementCredentials(",
+  "codex-multi-auth r31 policy: a replaced credential keeps its late 401",
+  "                if (refreshed.account.access !== refreshed.accessToken) {",
+  "codex-multi-auth r31 policy: a pool-exhaustion 503 names at least 1 ms",
+  "            retry_after_ms: managedRetryAfterMs,",
   'function managedServiceTierWireValue(parsedBody) {',
   'switch (parsedBody?.service_tier)',
   'case "default": return "default";',
@@ -111,6 +115,17 @@ if (source.split(replacementAdoptionMarker).length - 1 !== 2 ||
       "                if (state.managedMachineRouter) {\n" +
       `                    // ${replacementAdoptionMarker}.\n`,
     ).length - 1 !== 1) {
+  process.exit(1);
+}
+const replacedCredentialMarker =
+  "codex-multi-auth r31 policy: a replaced credential keeps its late 401";
+if (source.split(replacedCredentialMarker).length - 1 !== 1 ||
+    source.split(
+      "            if (upstream.status === HTTP_STATUS.UNAUTHORIZED) {\n" +
+      "                const bodyText = await managedReadErrorBody(upstream, state.streamStallTimeoutMs, managedLifecycle);\n" +
+      `                // ${replacedCredentialMarker}.\n`,
+    ).length - 1 !== 1 ||
+    source.includes("            retry_after_ms: waitMs,\n")) {
   process.exit(1);
 }
 const preHeaderRelease = source.indexOf(

@@ -15,6 +15,10 @@ const standardNonResponsesRoutingHintMarker = "codex-multi-auth r14 policy: stri
 const clientTierMarker = "codex-multi-auth r23 policy: honor per-request service tier";
 const replacementAdoptionMarker =
   "codex-multi-auth r28 policy: adopt a re-login before refusing an exhausted pool";
+const replacedCredentialMarker =
+  "codex-multi-auth r31 policy: a replaced credential keeps its late 401";
+const exhaustionRetryFloorMarker =
+  "codex-multi-auth r31 policy: a pool-exhaustion 503 names at least 1 ms";
 const managedTierMarker = "codex-multi-auth r15 policy: enforce machine-local service tier";
 const managedRoutingHintMarker = "codex-multi-auth r15 policy: bind canonical machine-local routing hint";
 const managedNonResponsesRoutingHintMarker = "codex-multi-auth r15 policy: strip managed routing hint from non-Responses requests";
@@ -2364,6 +2368,68 @@ if (!source.includes(replacementAdoptionMarker)) {
   ].join("\n"), "managed no-account branch");
 }
 
+// r28 made an invalidation and an auth-failure backoff belong to the credential
+// that earned them. A 401 answering a request sent before the resident manager
+// adopted a re-login (or a refresh) still landed on the account's new
+// credential: an invalidation and a 5-minute backoff for a token that never
+// failed. The request carried refreshed.accessToken; when that is no longer the
+// account's current token, the 401 belongs to the replaced credential, so mark
+// nothing and retry the request on the current one.
+const replacedCredentialUnauthorizedNeedle = [
+  "            if (upstream.status === HTTP_STATUS.UNAUTHORIZED) {",
+  "                const bodyText = await managedReadErrorBody(upstream, state.streamStallTimeoutMs, managedLifecycle);",
+  "",
+].join("\n");
+const replacedCredentialUnauthorizedBlock = [
+  `                // ${replacedCredentialMarker}.`,
+  "                // A re-login or a refresh replaced this account's credential while the",
+  "                // request was in flight. The 401 belongs to the token the request",
+  "                // carried: mark nothing and retry the request on the current one.",
+  "                if (refreshed.account.access !== refreshed.accessToken) {",
+  '                    exhaustionReason = "auth-failure";',
+  "                    managedRetryAccountIndex = refreshed.account.index;",
+  "                    attemptedIndexes.delete(refreshed.account.index);",
+  "                    state.status.retries += 1;",
+  "                    continue;",
+  "                }",
+  "",
+].join("\n");
+if (!source.includes(replacedCredentialMarker)) {
+  const start = source.indexOf(replacedCredentialUnauthorizedNeedle);
+  if (start < 0 || source.indexOf(replacedCredentialUnauthorizedNeedle,
+    start + replacedCredentialUnauthorizedNeedle.length) >= 0) {
+    throw new Error("unsupported codex-multi-auth upstream 401 layout; refusing an unsafe patch");
+  }
+  const end = start + replacedCredentialUnauthorizedNeedle.length;
+  source = source.slice(0, end) + replacedCredentialUnauthorizedBlock + source.slice(end);
+}
+
+// The pool-exhaustion 503 already floors Retry-After at one second, but its
+// body published retry_after_ms 0 whenever every cooldown had lapsed by the
+// time the refusal was written (seen under load with 100 ms windows). Zero
+// reads as "retry immediately"; publish at least 1 ms, as the header does.
+const exhaustionRetryHeaderLine =
+  "    res.setHeader(\"retry-after\", String(managedRetryAfterSeconds));\n";
+const exhaustionRetryBodyLine = "            retry_after_ms: waitMs,\n";
+if (!source.includes(exhaustionRetryFloorMarker)) {
+  const functionNeedle = "function writePoolExhausted(params) {\n";
+  const functionStart = source.indexOf(functionNeedle);
+  const functionEnd = functionStart < 0 ? -1 : source.indexOf("\n}\n", functionStart);
+  const body = functionEnd < 0 ? "" : source.slice(functionStart, functionEnd);
+  if (functionStart < 0 || source.indexOf(functionNeedle, functionStart + 1) >= 0 ||
+      body.split(exhaustionRetryHeaderLine).length !== 2 ||
+      body.split(exhaustionRetryBodyLine).length !== 2 ||
+      body.indexOf(exhaustionRetryHeaderLine) > body.indexOf(exhaustionRetryBodyLine)) {
+    throw new Error("unsupported codex-multi-auth pool-exhaustion body; refusing an unsafe patch");
+  }
+  const flooredBody = body
+    .replace(exhaustionRetryHeaderLine, () => exhaustionRetryHeaderLine +
+      `    // ${exhaustionRetryFloorMarker}.\n` +
+      "    const managedRetryAfterMs = Number.isFinite(waitMs) && waitMs > 0 ? waitMs : 1;\n")
+    .replace(exhaustionRetryBodyLine, () => "            retry_after_ms: managedRetryAfterMs,\n");
+  source = source.slice(0, functionStart) + flooredBody + source.slice(functionEnd);
+}
+
 const requiredSnippets = [
   identityMarker,
   rotationMarker,
@@ -2383,6 +2449,10 @@ const requiredSnippets = [
   'typeof accountManager.adoptReplacementCredentials !== "function"',
   "        let managedReplacementAdoptionTried = false;",
   "                        const releasedIndexes = await adoptManagedReplacementCredentials(",
+  replacedCredentialMarker,
+  "                if (refreshed.account.access !== refreshed.accessToken) {",
+  exhaustionRetryFloorMarker,
+  "            retry_after_ms: managedRetryAfterMs,",
   "codex-multi-auth r23 policy: honor per-request service tier",
   'function managedServiceTierWireValue(parsedBody) {',
   'switch (parsedBody?.service_tier)',
@@ -2484,6 +2554,15 @@ if (source.split(replacementAdoptionMarker).length - 1 !== 2 ||
       `                    // ${replacementAdoptionMarker}.\n`,
     ).length - 1 !== 1) {
   throw new Error("codex-multi-auth r28 re-login adoption is duplicated or misplaced");
+}
+// The r31 replaced-credential check runs first in the upstream 401 branch, once,
+// and the exhaustion body no longer publishes the unfloored wait.
+if (source.split(replacedCredentialMarker).length - 1 !== 1 ||
+    source.split(replacedCredentialUnauthorizedNeedle +
+      `                // ${replacedCredentialMarker}.\n`).length - 1 !== 1 ||
+    source.split(exhaustionRetryFloorMarker).length - 1 !== 1 ||
+    source.includes(exhaustionRetryBodyLine)) {
+  throw new Error("codex-multi-auth r31 replaced-credential 401 or exhaustion floor is duplicated or misplaced");
 }
 const preHeaderRelease = source.indexOf(
   "            // Admission bounds only token refresh and the pre-header fetch.\n" +

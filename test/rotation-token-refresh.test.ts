@@ -746,6 +746,58 @@ describe("re-login while an explicit invalidation is resident", () => {
 		expect(manager.getAccountRuntimeSkipReason(0, FAMILY, MODEL)).toBeNull();
 	});
 
+	// The refresh of the old credential is still in flight when the resident
+	// manager adopts the re-login: its failure belongs to the replaced credential.
+	it("leaves a re-login adopted during a failed refresh unmarked and uses it", async () => {
+		const manager = managerWith(STALE_EXPIRES);
+		const account = refreshParams(manager).account;
+		statefulDisk(reloginStorage({ coolingDownUntil: undefined, cooldownReason: undefined }));
+		queuedRefreshMock.mockImplementation(async () => {
+			await manager.saveToDisk();
+			return {
+				type: "failed",
+				reason: "http_error",
+				statusCode: 401,
+				message: "Your authentication token has been invalidated.",
+			};
+		});
+
+		const result = await ensureFreshAccessToken({ ...refreshParams(manager), model: MODEL });
+
+		expect(queuedRefreshMock).toHaveBeenCalledExactlyOnceWith("refresh-1");
+		expect(result).toMatchObject({ ok: true, accessToken: "access-relogin" });
+		expect(manager.getAccountByIndex(0)).toBe(account);
+		expect(manager.isAccountAuthInvalidated(account)).toBe(false);
+		expect(account.cooldownReason).toBeUndefined();
+		expect(account.consecutiveAuthFailures ?? 0).toBe(0);
+		expect(manager.getAccountRuntimeSkipReason(0, FAMILY, MODEL)).toBeNull();
+	});
+
+	it("re-evaluates a replaced credential once and still marks nothing", async () => {
+		const manager = managerWith(STALE_EXPIRES);
+		const account = refreshParams(manager).account;
+		let generation = 0;
+		queuedRefreshMock.mockImplementation(async () => {
+			// Each refresh races another replacement that is itself due a refresh.
+			generation += 1;
+			account.refreshToken = `refresh-replaced-${generation}`;
+			account.access = `access-replaced-${generation}`;
+			account.expires = STALE_EXPIRES;
+			return { type: "failed", reason: "network_error", message: "fetch failed" };
+		});
+
+		const result = await ensureFreshAccessToken({ ...refreshParams(manager), model: MODEL });
+
+		expect(result).toEqual({ ok: false, retryable: true });
+		expect(queuedRefreshMock.mock.calls.map(([token]) => token)).toEqual([
+			"refresh-1",
+			"refresh-replaced-1",
+		]);
+		expect(manager.isAccountAuthInvalidated(account)).toBe(false);
+		expect(account.cooldownReason).toBeUndefined();
+		expect(account.consecutiveAuthFailures ?? 0).toBe(0);
+	});
+
 	// A managed router whose whole pool is unavailable makes no routine saves,
 	// so it asks for a waiting replacement directly before refusing a request.
 	describe("adoptReplacementCredentials", () => {

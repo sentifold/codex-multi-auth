@@ -15,8 +15,11 @@
 // patching the unpatched file. r28 also makes the CLI login write
 // (dist/lib/codex-manager/account-pool-write.js) drop the replaced
 // credential's auth-failure cooldown along with its invalidation, so a router
-// restarted right after a login routes the account at once. Any other layout
-// of either file is refused before a write.
+// restarted right after a login routes the account at once. r31 makes a token
+// refresh that fails after the account's credential was replaced
+// (dist/lib/runtime/rotation-token-refresh.js) mark nothing and evaluate the
+// current credential instead. Any other layout of these files is refused
+// before a write.
 const fs = require("node:fs");
 const path = require("node:path");
 const { spawnSync } = require("node:child_process");
@@ -188,6 +191,27 @@ const loginReleasing = `            enabled: write.preserveEnabledState ? existi
 const loginSites = [{ base: loginBase, r28: loginReleasing }];
 const loginLayouts = ["base", "r28"];
 
+// The runtime token refresh (base, r31). A refresh that fails for a token the
+// account no longer holds belongs to the replaced credential, like its
+// invalidation and backoff: a re-login adopted while the refresh ran must not
+// be invalidated or backed off for it.
+const refreshMarker = "codex-multi-auth r31: a replaced credential keeps its refresh failure";
+const refreshBase = `    const refreshResult = await queuedRefresh(account.refreshToken);
+    if (refreshResult.type === "failed") {`;
+const refreshReleasing = `    const refreshedToken = account.refreshToken;
+    const refreshResult = await queuedRefresh(refreshedToken);
+    // ${refreshMarker}.
+    // A re-login adopted while this refresh ran replaced the token it used:
+    // mark nothing and evaluate the account's current credential instead.
+    if (refreshResult.type === "failed" && account.refreshToken !== refreshedToken) {
+        return params.replacedCredentialRetried
+            ? { ok: false, retryable: true }
+            : ensureFreshAccessToken({ ...params, replacedCredentialRetried: true });
+    }
+    if (refreshResult.type === "failed") {`;
+const refreshSites = [{ base: refreshBase, r31: refreshReleasing }];
+const refreshLayouts = ["base", "r31"];
+
 function convert(source, from, to, table = sites, what = "account persistence") {
   let next = source;
   for (const site of table) {
@@ -222,6 +246,15 @@ function renderLoginWrite(source, target) {
   return { current, text: convert(base, "base", target, loginSites, "login write") };
 }
 
+// The same for dist/lib/runtime/rotation-token-refresh.js (base, r31).
+function renderRefreshFailure(source, target) {
+  if (!refreshLayouts.includes(target)) throw new Error(`unknown token refresh layout: ${target}`);
+  const current = source.includes(refreshMarker) ? "r31" : "base";
+  const base = convert(source, current, "base", refreshSites, "token refresh");
+  if (base.includes("codex-multi-auth r31:")) throw new Error("incomplete token refresh patch");
+  return { current, text: convert(base, "base", target, refreshSites, "token refresh") };
+}
+
 // Syntax-check a rendered module before anything is written.
 function assertParses(text, what) {
   const parsed = spawnSync(process.execPath, ["--input-type=module", "--check"], { input: text, encoding: "utf8" });
@@ -244,10 +277,13 @@ function main() {
   if (!root || !path.isAbsolute(root)) throw new Error("absolute package root required");
   const file = path.join(root, "dist/lib/accounts.js");
   const loginFile = path.join(root, "dist/lib/codex-manager/account-pool-write.js");
+  const refreshFile = path.join(root, "dist/lib/runtime/rotation-token-refresh.js");
   const original = fs.readFileSync(file, "utf8");
   const loginOriginal = fs.readFileSync(loginFile, "utf8");
+  const refreshOriginal = fs.readFileSync(refreshFile, "utf8");
   const { current, text: next } = render(original, "r28");
   const { current: loginCurrent, text: loginNext } = renderLoginWrite(loginOriginal, "r28");
+  const { current: refreshCurrent, text: refreshNext } = renderRefreshFailure(refreshOriginal, "r31");
   if (check && current !== "r28") {
     throw new Error(current === "r24"
       ? "live credential convergence is r24; re-run without --check to upgrade it to r28"
@@ -256,18 +292,24 @@ function main() {
   if (check && loginCurrent !== "r28") {
     throw new Error("missing r28 login write patch; re-run without --check to add it");
   }
+  if (check && refreshCurrent !== "r31") {
+    throw new Error("missing r31 token refresh patch; re-run without --check to add it");
+  }
   if (current === "r28" && next !== original) throw new Error("incomplete live credential convergence patch");
   if (loginCurrent === "r28" && loginNext !== loginOriginal) throw new Error("incomplete login write patch");
+  if (refreshCurrent === "r31" && refreshNext !== refreshOriginal) throw new Error("incomplete token refresh patch");
   assertParses(next, "accounts");
   assertParses(loginNext, "login write");
+  assertParses(refreshNext, "token refresh");
   if (next !== original) replaceFile(file, next);
   if (loginNext !== loginOriginal) replaceFile(loginFile, loginNext);
-  const outcome = check || (current === "r28" && loginCurrent === "r28")
+  if (refreshNext !== refreshOriginal) replaceFile(refreshFile, refreshNext);
+  const outcome = check || (current === "r28" && loginCurrent === "r28" && refreshCurrent === "r31")
     ? "verified"
     : current === "r24" ? "upgraded r24 to r28" : "patched";
-  console.log(`Live credential convergence (r28): ${outcome}`);
+  console.log(`Live credential convergence (r28, r31 token refresh): ${outcome}`);
 }
 
 // Tests require this file to derive the base, r24 and r28 layouts of a staged copy.
 if (require.main === module) main();
-else module.exports = { render, renderLoginWrite };
+else module.exports = { render, renderLoginWrite, renderRefreshFailure };

@@ -83,6 +83,8 @@ export async function ensureFreshAccessToken(params: {
 	now: number;
 	tokenRefreshSkewMs: number;
 	tokenInvalidationCooldownMs: number;
+	/** Set on the one re-evaluation after a replaced credential's refresh failed. */
+	replacedCredentialRetried?: boolean;
 }): Promise<
 	| { ok: true; accessToken: string; account: ManagedAccount }
 	| { ok: false; retryable: boolean; invalidated?: boolean }
@@ -93,7 +95,17 @@ export async function ensureFreshAccessToken(params: {
 		return { ok: true, accessToken: account.access ?? "", account };
 	}
 
-	const refreshResult = await queuedRefresh(account.refreshToken);
+	const refreshedToken = account.refreshToken;
+	const refreshResult = await queuedRefresh(refreshedToken);
+	// A re-login adopted while this refresh ran replaced the token it used. The
+	// failure belongs to that replaced credential, like its invalidation and
+	// auth backoff: mark nothing and evaluate the account's current credential
+	// instead, once.
+	if (refreshResult.type === "failed" && account.refreshToken !== refreshedToken) {
+		return params.replacedCredentialRetried
+			? { ok: false, retryable: true }
+			: ensureFreshAccessToken({ ...params, replacedCredentialRetried: true });
+	}
 	if (refreshResult.type === "failed") {
 		accountManager.recordFailure(account, family, model);
 		accountManager.incrementAuthFailures(account);
