@@ -229,6 +229,16 @@ layout from a staged copy. The proxy adoption lives in
 `payloads/codex-runtime.cjs` behind its own marker, so re-running the patch on
 an older patched proxy adds only that block.
 
+The fix holds only while every resident AccountManager on the store runs it.
+A Codex app bind router (`rotation bind-app`, and `rotation enable` or
+`rotation reset-runtime`, which bind as well) is a second one. It runs
+`scripts/codex-app-router.js` from the package that bound it, through a
+LaunchAgent that names that package by absolute path, so patching or replacing
+the machine router leaves it on the old code. An unpatched or r24 app router
+writes the old invalidation back onto the new refresh token, where r28 has to
+keep it. Unbind it, or bind it again from the patched package (`unbind-app`,
+then `bind-app`; `bind-app` alone keeps a running router).
+
 
 ### r25: opt-in subscription final-week preference
 

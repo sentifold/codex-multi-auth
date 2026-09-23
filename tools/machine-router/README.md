@@ -96,6 +96,23 @@ Open sessions keep a valid provider URL and pick up the replacement on their
 next request. An in-flight stream may fail during replacement, which is why
 this is a scheduled operation rather than something to do mid-turn.
 
+Keep the router the only resident process on the account store. A Codex app
+bind (`codex-multi-auth rotation bind-app`; `rotation enable` and
+`rotation reset-runtime` bind as well) starts `scripts/codex-app-router.js`, a
+second resident AccountManager on the same store. Its own LaunchAgent,
+`com.ndycode.codex-multi-auth.runtime-router`, names the package that bound it
+by absolute path. Replacing this router, re-running the patch or moving the
+installed package leaves it on its old code. Each of its saves writes its own
+view of every account back to the store, which restores invalidations and
+cooldowns that were cleared and drops accounts added since it started.
+
+Its script path shows which package it runs, and
+`plutil -extract ProgramArguments.1 raw -o - <plist>` prints just that path. Do
+not print the whole LaunchAgent or the process's command line (`ps`); both
+carry the bind's identity token. Before you replace this router, remove the
+app bind router with `rotation unbind-app` run from the patched package, or
+bind it again from there (`unbind-app`, then `bind-app`).
+
 ## Task speed (r23)
 
 The daemon no longer reads `~/.config/agent-router/codex-service-tier` and drops
