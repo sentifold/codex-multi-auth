@@ -2163,6 +2163,123 @@ describe("OpenAIOAuthPlugin fetch handler", () => {
 		expect(thirdHeaders.get("x-test-account-id")).toBe("acc-2");
 		expect(thirdHeaders.get("x-test-access-token")).toBe("access-beta");
 	});
+
+	// Three accounts behind a scripted hybrid selector (alpha, beta, gamma in
+	// order) with session affinity on and response continuation off, so the
+	// account binding is the only state a turn carries into the next one.
+	const setupSessionAffinityRouting = async (sessionKey: string) => {
+		const { AccountManager } = await import("../lib/accounts.js");
+		const configModule = await import("../lib/config.js");
+		const fetchHelpers = await import("../lib/request/fetch-helpers.js");
+		const accounts = [
+			{ index: 0, accountId: "acc-1", refreshToken: "refresh-1", accessToken: "access-alpha" },
+			{ index: 1, accountId: "acc-2", refreshToken: "refresh-2", accessToken: "access-beta" },
+			{ index: 2, accountId: "acc-3", refreshToken: "refresh-3", accessToken: "access-gamma" },
+		];
+		const unusable = new Set<number>();
+		let selection = 0;
+		vi.spyOn(AccountManager, "loadFromDisk").mockResolvedValueOnce({
+			...buildRoutingManager(accounts),
+			getCurrentOrNextForFamilyHybrid: () => accounts[selection++] ?? null,
+			getCurrentOrNextForFamily: () => accounts[selection++] ?? null,
+			isAccountAvailableForFamily: (index: number) =>
+				Boolean(accounts[index]) && !unusable.has(index),
+		} as never);
+		vi.mocked(configModule.getSessionAffinity).mockReturnValue(true);
+		vi.mocked(configModule.getResponseContinuation).mockReturnValue(false);
+		extractAccountIdMock.mockImplementation(
+			(accessToken: unknown) =>
+				accounts.find((account) => account.accessToken === accessToken)
+					?.accountId ?? "account-1",
+		);
+		vi.mocked(fetchHelpers.createCodexHeaders).mockImplementation(
+			(_init, accountId) =>
+				new Headers({ "x-test-account-id": String(accountId) }),
+		);
+		vi.mocked(fetchHelpers.transformRequestForCodex).mockImplementation(
+			async (init, _url, _userConfig, _codexMode, body) => ({
+				updatedInit: {
+					...(init as RequestInit),
+					body: JSON.stringify(body ?? {}),
+				},
+				body: (body ?? { model: "gpt-5.4" }) as {
+					model: string;
+					prompt_cache_key?: string;
+				},
+			}),
+		);
+
+		const { sdk } = await setupPlugin();
+		const sendTurn = () =>
+			sdk.fetch!("https://api.openai.com/v1/chat", {
+				method: "POST",
+				body: JSON.stringify({ model: "gpt-5.4", prompt_cache_key: sessionKey }),
+			});
+		const servedBy = () =>
+			vi
+				.mocked(globalThis.fetch)
+				.mock.calls.map(([, init]) =>
+					new Headers((init as RequestInit).headers).get("x-test-account-id"),
+				);
+		return { unusable, sendTurn, servedBy };
+	};
+
+	it("keeps the session on the failover account after its preferred account becomes unusable", async () => {
+		globalThis.fetch = vi
+			.fn()
+			.mockImplementation(
+				async () =>
+					new Response(JSON.stringify({ content: "ok" }), { status: 200 }),
+			);
+		const { unusable, sendTurn, servedBy } =
+			await setupSessionAffinityRouting("ses_failover");
+
+		await sendTurn();
+		// The session's account becomes unusable: the next turn drops the
+		// stale binding and fails over within the same request.
+		unusable.add(0);
+		await sendTurn();
+		await sendTurn();
+
+		expect(servedBy()).toEqual(["acc-1", "acc-2", "acc-2"]);
+	});
+
+	it("does not let an older overlapping turn re-bind a session a newer turn dropped", async () => {
+		let releaseOlderTurn!: () => void;
+		const olderTurnReleased = new Promise<void>((resolve) => {
+			releaseOlderTurn = resolve;
+		});
+		let upstreamCalls = 0;
+		globalThis.fetch = vi.fn().mockImplementation(async () => {
+			const call = (upstreamCalls += 1);
+			if (call === 2) await olderTurnReleased;
+			if (call === 3) {
+				return new Response(
+					JSON.stringify({ error: { message: "bad request" } }),
+					{ status: 400 },
+				);
+			}
+			return new Response(JSON.stringify({ content: "ok" }), { status: 200 });
+		});
+		const { unusable, sendTurn, servedBy } =
+			await setupSessionAffinityRouting("ses_overlap");
+
+		await sendTurn();
+		// The older turn follows the binding and is still upstream...
+		const olderTurn = sendTurn();
+		await vi.waitFor(() => expect(upstreamCalls).toBe(2));
+		// ...when a newer turn finds the account unusable, drops the binding and
+		// fails on its failover account without binding a new one.
+		unusable.add(0);
+		expect((await sendTurn()).status).toBe(400);
+		releaseOlderTurn();
+		expect((await olderTurn).status).toBe(200);
+		unusable.delete(0);
+		await sendTurn();
+
+		expect(servedBy()).toEqual(["acc-1", "acc-1", "acc-2", "acc-3"]);
+	});
+
 	it("compacts fast-session input before sending the upstream request when compaction succeeds", async () => {
 		const fetchHelpers = await import("../lib/request/fetch-helpers.js");
 		const longInput = Array.from({ length: 12 }, (_value, index) => ({

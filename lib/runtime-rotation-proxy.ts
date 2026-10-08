@@ -1790,6 +1790,12 @@ async function handleRequestInner(
 			return meta;
 		};
 		const storageMeta = reconcileManualSelection();
+		// Order this request's affinity writes by when it started, not by when
+		// they land. Reserved after the reconcile above, so an affinity reset
+		// observed later in this request (a generation bump or a native
+		// inventory rebuild) refuses the binding to the account selected
+		// before it.
+		const sessionAffinityVersion = state.sessionAffinityStore?.nextWriteVersion();
 		// The ephemeral --account pin (issue #623) takes precedence over the
 		// persisted `switch` pin for this invocation, without ever mutating disk
 		// state. Use `??` (not `||`) so a forced index of 0 is honored. When set,
@@ -2372,7 +2378,11 @@ async function handleRequestInner(
 				if (refreshed.invalidated) {
 					// Refresh endpoint explicitly revoked the token. Stop cascade:
 					// return auth error to client instead of rotating to the next account.
-					state.sessionAffinityStore?.forgetSession(context.sessionKey);
+					state.sessionAffinityStore?.forgetSession(
+						context.sessionKey,
+						state.now(),
+						sessionAffinityVersion,
+					);
 					res.writeHead(HTTP_STATUS.UNAUTHORIZED, { "content-type": "application/json" });
 					// Route through the shared builder so both invalidation exit paths stay
 					// in lockstep — empty input yields { error: { message: <fallback>,
@@ -2732,7 +2742,11 @@ async function handleRequestInner(
 						accountManager.setAccountEnabled(refreshed.account.index, false);
 						accountManager.saveToDiskDebounced();
 					}
-					state.sessionAffinityStore?.forgetSession(context.sessionKey);
+					state.sessionAffinityStore?.forgetSession(
+						context.sessionKey,
+						state.now(),
+						sessionAffinityVersion,
+					);
 					exhaustionReason = "deactivated";
 					capabilityRejectionIsLatest = false;
 					state.status.retries += 1;
@@ -2828,7 +2842,11 @@ async function handleRequestInner(
 						refreshed.account,
 						state.tokenInvalidationCooldownMs,
 					);
-					state.sessionAffinityStore?.forgetSession(context.sessionKey);
+					state.sessionAffinityStore?.forgetSession(
+						context.sessionKey,
+						state.now(),
+						sessionAffinityVersion,
+					);
 					// The invalidation marker must be durable before returning the 401.
 					// A delayed save would allow a proxy restart to reload and route the
 					// revoked account again.
@@ -2964,13 +2982,18 @@ async function handleRequestInner(
 					"quota",
 					context.model,
 				);
-				state.sessionAffinityStore?.forgetSession(context.sessionKey);
+				state.sessionAffinityStore?.forgetSession(
+					context.sessionKey,
+					state.now(),
+					sessionAffinityVersion,
+				);
 				accountManager.saveToDiskDebounced();
 			} else {
-				state.sessionAffinityStore?.remember(
+				state.sessionAffinityStore?.rememberWithVersion(
 					context.sessionKey,
 					refreshed.account.index,
 					state.now(),
+					sessionAffinityVersion,
 				);
 				if (refreshed.account.index !== state.lastGlobalAccountIndex) {
 					state.lastGlobalAccountIndex = refreshed.account.index;
@@ -3026,7 +3049,11 @@ async function handleRequestInner(
 						state.networkErrorCooldownMs,
 						"network-error",
 					);
-					state.sessionAffinityStore?.forgetSession(context.sessionKey);
+					state.sessionAffinityStore?.forgetSession(
+						context.sessionKey,
+						state.now(),
+						sessionAffinityVersion,
+					);
 					accountManager.saveToDiskDebounced();
 				},
 				state.streamStallTimeoutMs,
@@ -3041,7 +3068,11 @@ async function handleRequestInner(
 				accountManager.recordSuccess(refreshed.account, context.family, context.model);
 				recordRuntimeAccountRecovery(refreshed.account.index);
 			} else if (!clientDisconnected) {
-				state.sessionAffinityStore?.forgetSession(context.sessionKey);
+				state.sessionAffinityStore?.forgetSession(
+					context.sessionKey,
+					state.now(),
+					sessionAffinityVersion,
+				);
 				const rejection = classifyCapabilityFailure(400, responseOutcome.rejection);
 				if (rejection && context.model) {
 					const body = parseRequestBody(context.body);

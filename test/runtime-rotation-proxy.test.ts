@@ -2735,6 +2735,64 @@ describe("runtime rotation proxy", () => {
 		]);
 	});
 
+	it("does not re-bind a session to the account a request chose before an affinity reset", async () => {
+		// The default 60 s rotation stickiness would also send the next turn back
+		// to the last-used account. Turn it off so only session affinity can
+		// repeat an account, as for a turn that arrives after that window.
+		vi.stubEnv("CODEX_AUTH_MIN_ROTATION_INTERVAL_MS", "0");
+		let affinityGeneration = 0;
+		const metaSpy = vi
+			.spyOn(storageMetaModule, "readStorageMetaFromDisk")
+			.mockImplementation(() => ({ pinnedAccountIndex: null, affinityGeneration }));
+		const clearSpy = vi.spyOn(SessionAffinityStore.prototype, "clearAll");
+		try {
+			const accountManager = new AccountManager(undefined, createStorage(Date.now(), 3));
+			let firstTurnUpstream!: () => void;
+			const firstTurnReachedUpstream = new Promise<void>((resolve) => {
+				firstTurnUpstream = resolve;
+			});
+			let releaseFirstTurn!: () => void;
+			const firstTurnReleased = new Promise<void>((resolve) => {
+				releaseFirstTurn = resolve;
+			});
+			const { calls, fetchImpl } = createRecordingFetch(async (_call, attempt) => {
+				if (attempt === 1) {
+					firstTurnUpstream();
+					await firstTurnReleased;
+				}
+				return textEventStream(`data: turn-${attempt}\n\n`);
+			});
+			const proxy = await startProxy({ accountManager, fetchImpl });
+			const body = {
+				model: "gpt-5-codex",
+				stream: true,
+				metadata: { session_id: "thread-reset-mid-request" },
+			};
+
+			const firstTurn = postResponses(proxy, body);
+			await firstTurnReachedUpstream;
+			// An affinity reset that leaves no pin (`unpin`, `best`, an account
+			// removal or a backup restore) lands while the first turn is upstream.
+			affinityGeneration = 1;
+			releaseFirstTurn();
+			await (await firstTurn).text();
+
+			expect(clearSpy).toHaveBeenCalledTimes(1);
+			const store = clearSpy.mock.contexts[0] as SessionAffinityStore;
+			expect(store.getPreferredAccountIndex("thread-reset-mid-request")).toBeNull();
+
+			await (await postResponses(proxy, body)).text();
+			const accountIds = calls.map((call) => call.headers.get(OPENAI_HEADERS.ACCOUNT_ID));
+			expect(accountIds).toHaveLength(2);
+			expect(accountIds[0]).toBe("acc_1");
+			expect(accountIds[1]).not.toBe("acc_1");
+		} finally {
+			clearSpy.mockRestore();
+			metaSpy.mockRestore();
+			vi.unstubAllEnvs();
+		}
+	});
+
 	it("retries a 429 on another account before returning bytes to the client", async () => {
 		const now = Date.now();
 		const accountManager = new AccountManager(undefined, createStorage(now));

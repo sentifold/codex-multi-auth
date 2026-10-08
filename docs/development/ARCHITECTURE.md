@@ -117,7 +117,7 @@ Per accepted request, `lib/runtime-rotation-proxy.ts` runs this pipeline. Steps 
 2. **Policy priority tiers** — accounts with a `priority` (0–9) from `codex-multi-auth account priority`, lowest tier first.
 3. **Hard pin** — `--account` / `CODEX_MULTI_AUTH_FORCE_ACCOUNT_INDEX` (ephemeral): `missing` → immediate exit, `policy-blocked`/`disabled` → exit, cooldown honored only with `allowPinnedCooldown`; never advances the rotation cursor.
 4. **Sequential** (`schedulingStrategy=sequential`, drain-first): stick to the current account while usable; advance only on true exhaustion.
-5. **Session affinity** — `SessionAffinityStore` Map, 20-minute TTL, 512-entry LRU; session key from `session_id`/`conversation_id` headers → `prompt_cache_key` → `previous_response_id` → `metadata.{session_id,conversation_id,thread_id}`; a taken slot calls `markSwitched`.
+5. **Session affinity** — `SessionAffinityStore` Map, 20-minute TTL, 512-entry LRU; session key from `session_id`/`conversation_id` headers → `prompt_cache_key` → `previous_response_id` → `metadata.{session_id,conversation_id,thread_id}`; a taken slot calls `markSwitched`. Writes carry the request's write version: a forget leaves a TTL-bounded tombstone and an affinity reset (`clearAll`) refuses versions reserved before it, so a request still in flight cannot re-bind a session that a newer request dropped or an affinity reset cleared.
 6. **Hybrid** — `selectHybridAccount`: `health*2 + tokens*5 + hoursSinceUsed*2 + capabilityBoost + scoreBoostByAccount`, plus PID-offset jitter, plus a `+1000` sticky boost inside `minRotationIntervalMs`. Eligible = enabled + workspace-enabled + not rate-limited/invalidated/cooling/circuit-open.
 7. **Linear scan** — first eligible account not already attempted.
 

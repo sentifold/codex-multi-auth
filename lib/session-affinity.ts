@@ -15,6 +15,16 @@ interface SessionAffinityEntry {
 	writeVersion: number;
 }
 
+/**
+ * Records that a session was forgotten at `writeVersion`. A plain map delete
+ * would erase the version a forget was ordered at, letting a request that
+ * selected its account before the forget re-bind the session after it.
+ */
+interface SessionAffinityTombstone {
+	expiresAt: number;
+	writeVersion: number;
+}
+
 const DEFAULT_TTL_MS = 20 * 60 * 1000;
 const DEFAULT_MAX_ENTRIES = 512;
 const MAX_SESSION_KEY_LENGTH = 256;
@@ -43,7 +53,10 @@ export class SessionAffinityStore {
 	private readonly ttlMs: number;
 	private readonly maxEntries: number;
 	private readonly entries = new Map<string, SessionAffinityEntry>();
+	private readonly tombstones = new Map<string, SessionAffinityTombstone>();
 	private writeVersionCounter = 0;
+	/** Writes below this version predate the last `clearAll` and are refused. */
+	private writeVersionFloor = 0;
 
 	constructor(options: SessionAffinityOptions = {}) {
 		this.ttlMs = Math.max(1_000, Math.floor(options.ttlMs ?? DEFAULT_TTL_MS));
@@ -77,6 +90,7 @@ export class SessionAffinityStore {
 		if (!key) return;
 		if (!Number.isFinite(accountIndex) || accountIndex < 0) return;
 		const normalizedWriteVersion = this.normalizeWriteVersion(writeVersion);
+		if (normalizedWriteVersion < this.writeVersionFloor) return;
 
 		const existingEntry = this.entries.get(key);
 		if (
@@ -86,7 +100,16 @@ export class SessionAffinityStore {
 		) {
 			return;
 		}
+		const tombstone = this.tombstones.get(key);
+		if (
+			tombstone &&
+			tombstone.expiresAt > now &&
+			tombstone.writeVersion > normalizedWriteVersion
+		) {
+			return;
+		}
 
+		this.tombstones.delete(key);
 		this.setEntry(key, {
 			accountIndex,
 			expiresAt: now + this.ttlMs,
@@ -136,6 +159,7 @@ export class SessionAffinityStore {
 		const normalizedResponseId = typeof responseId === "string" ? responseId.trim() : "";
 		if (!key || !normalizedResponseId) return;
 		const normalizedWriteVersion = this.normalizeWriteVersion(writeVersion);
+		if (normalizedWriteVersion < this.writeVersionFloor) return;
 
 		const entry = this.entries.get(key);
 		if (!entry) return;
@@ -156,10 +180,46 @@ export class SessionAffinityStore {
 		});
 	}
 
-	forgetSession(sessionKey: string | null | undefined): void {
+	/**
+	 * Forget a session's binding. With a `writeVersion` the forget is ordered
+	 * like any other write: it does not erase a binding from a newer request,
+	 * and it leaves a tombstone (expiring with the ttl) so a request with an
+	 * older version cannot re-bind the session afterwards. A request that
+	 * forgets and then rebinds with its own version keeps the new binding.
+	 * Without a version the forget is ordered after every earlier write.
+	 */
+	forgetSession(
+		sessionKey: string | null | undefined,
+		now = Date.now(),
+		writeVersion?: number,
+	): void {
 		const key = normalizeSessionKey(sessionKey);
 		if (!key) return;
+		const normalizedWriteVersion = this.normalizeWriteVersion(writeVersion);
+		if (normalizedWriteVersion < this.writeVersionFloor) return;
+
+		const existingEntry = this.entries.get(key);
+		if (
+			existingEntry &&
+			existingEntry.expiresAt > now &&
+			existingEntry.writeVersion > normalizedWriteVersion
+		) {
+			return;
+		}
+		const tombstone = this.tombstones.get(key);
+		if (
+			tombstone &&
+			tombstone.expiresAt > now &&
+			tombstone.writeVersion >= normalizedWriteVersion
+		) {
+			return;
+		}
+
 		this.entries.delete(key);
+		this.setTombstone(key, {
+			expiresAt: now + this.ttlMs,
+			writeVersion: normalizedWriteVersion,
+		});
 	}
 
 	forgetAccount(accountIndex: number): number {
@@ -200,6 +260,9 @@ export class SessionAffinityStore {
 				removed += 1;
 			}
 		}
+		for (const [key, tombstone] of this.tombstones.entries()) {
+			if (tombstone.expiresAt <= now) this.tombstones.delete(key);
+		}
 		return removed;
 	}
 
@@ -208,10 +271,24 @@ export class SessionAffinityStore {
 	 * (via `switch`, `unpin`, or `best`) to invalidate sticky chat affinity so a
 	 * manual change takes effect on the next desktop-app request even mid-thread.
 	 * See issue #474.
+	 *
+	 * Writes with a version reserved before the clear are refused afterwards,
+	 * so a request still in flight cannot re-bind its session to the account
+	 * it selected before the change.
 	 */
 	clearAll(): void {
-		if (this.entries.size === 0) return;
+		this.writeVersionFloor = this.normalizeWriteVersion();
 		this.entries.clear();
+		this.tombstones.clear();
+	}
+
+	/**
+	 * Reserve a write version for a request that writes this store later. It
+	 * shares the counter used by unversioned writes, so a later unversioned
+	 * `forgetSession` or `clearAll` is ordered after the request.
+	 */
+	nextWriteVersion(): number {
+		return this.normalizeWriteVersion();
 	}
 
 	size(): number {
@@ -225,6 +302,16 @@ export class SessionAffinityStore {
 		}
 
 		this.entries.set(key, entry);
+	}
+
+	private setTombstone(key: string, tombstone: SessionAffinityTombstone): void {
+		// Re-insert so iteration order stays oldest-first for eviction.
+		this.tombstones.delete(key);
+		if (this.tombstones.size >= this.maxEntries) {
+			const oldest = this.tombstones.keys().next();
+			if (!oldest.done) this.tombstones.delete(oldest.value);
+		}
+		this.tombstones.set(key, tombstone);
 	}
 
 	private findOldestKey(): string | null {

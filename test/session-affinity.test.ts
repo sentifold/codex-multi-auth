@@ -158,6 +158,100 @@ describe("SessionAffinityStore", () => {
 		expect(store.getLastResponseId("session-a", 5_500)).toBe("resp_second");
 	});
 
+	it("does not let an older request re-bind a session a newer request forgot", () => {
+		const store = new SessionAffinityStore({ ttlMs: 60_000, maxEntries: 4 });
+		store.rememberWithVersion("session-a", 0, 1_000, 1);
+		// Request 3 found account 0 unusable and dropped the session.
+		store.forgetSession("session-a", 1_500, 3);
+
+		// Request 2 selected account 0 before that and finishes afterwards.
+		store.rememberWithVersion("session-a", 0, 2_000, 2);
+		store.updateLastResponseId("session-a", "resp_stale", 2_000, 2);
+		expect(store.getPreferredAccountIndex("session-a", 2_500)).toBeNull();
+		expect(store.getLastResponseId("session-a", 2_500)).toBeNull();
+
+		// A newer request can bind the session again.
+		store.rememberWithVersion("session-a", 1, 3_000, 4);
+		expect(store.getPreferredAccountIndex("session-a", 3_500)).toBe(1);
+	});
+
+	it("does not let an older request's forget erase a newer request's binding", () => {
+		const store = new SessionAffinityStore({ ttlMs: 60_000, maxEntries: 4 });
+		store.rememberWithVersion("session-a", 1, 1_000, 3);
+		store.forgetSession("session-a", 1_500, 2);
+
+		expect(store.getPreferredAccountIndex("session-a", 2_000)).toBe(1);
+	});
+
+	it("keeps the failover binding when a request forgets and then rebinds", () => {
+		const store = new SessionAffinityStore({ ttlMs: 60_000, maxEntries: 4 });
+		store.rememberWithVersion("session-a", 0, 1_000, 1);
+		// One request: the preferred account is unusable, then failover succeeds.
+		store.forgetSession("session-a", 1_500, 2);
+		store.rememberWithVersion("session-a", 1, 2_000, 2);
+
+		expect(store.getPreferredAccountIndex("session-a", 2_500)).toBe(1);
+	});
+
+	it("orders an unversioned forget after every earlier write", () => {
+		const store = new SessionAffinityStore({ ttlMs: 60_000, maxEntries: 4 });
+		store.rememberWithVersion("session-a", 0, 1_000, 100);
+		store.forgetSession("session-a");
+		store.rememberWithVersion("session-a", 1, 2_000, 100);
+
+		expect(store.getPreferredAccountIndex("session-a", 2_500)).toBeNull();
+	});
+
+	it("stops blocking stale writes once the forget is older than the ttl", () => {
+		const store = new SessionAffinityStore({ ttlMs: 1_000, maxEntries: 4 });
+		store.rememberWithVersion("session-a", 0, 1_000, 1);
+		store.forgetSession("session-a", 1_000, 3);
+		expect(store.size()).toBe(0);
+
+		store.rememberWithVersion("session-a", 2, 2_001, 2);
+		expect(store.getPreferredAccountIndex("session-a", 2_001)).toBe(2);
+	});
+
+	it("keeps at most maxEntries forgets, dropping the oldest first", () => {
+		const store = new SessionAffinityStore({ ttlMs: 60_000, maxEntries: 2 });
+		store.forgetSession("session-a", 1_000, 5);
+		store.forgetSession("session-b", 1_000, 5);
+		store.forgetSession("session-c", 1_000, 5);
+
+		// The oldest forget was evicted, so a stale write binds again.
+		store.rememberWithVersion("session-a", 0, 2_000, 1);
+		expect(store.getPreferredAccountIndex("session-a", 2_500)).toBe(0);
+		// The newer forgets still refuse it.
+		store.rememberWithVersion("session-c", 0, 2_000, 1);
+		expect(store.getPreferredAccountIndex("session-c", 2_500)).toBeNull();
+	});
+
+	it("does not let a request that started before clearAll re-bind any session", () => {
+		const store = new SessionAffinityStore({ ttlMs: 60_000, maxEntries: 4 });
+		store.rememberWithVersion("session-a", 0, 1_000, 5);
+		store.clearAll();
+
+		store.rememberWithVersion("session-a", 0, 2_000, 5);
+		store.rememberWithVersion("session-b", 1, 2_000, 4);
+		expect(store.getPreferredAccountIndex("session-a", 2_500)).toBeNull();
+		expect(store.getPreferredAccountIndex("session-b", 2_500)).toBeNull();
+
+		store.remember("session-a", 2, 3_000);
+		expect(store.getPreferredAccountIndex("session-a", 3_500)).toBe(2);
+	});
+
+	it("orders clearAll after versions reserved before it, even on an empty store", () => {
+		const store = new SessionAffinityStore({ ttlMs: 60_000, maxEntries: 4 });
+		const inFlight = store.nextWriteVersion();
+		store.clearAll();
+		const next = store.nextWriteVersion();
+
+		store.rememberWithVersion("session-a", 0, 1_000, inFlight);
+		expect(store.getPreferredAccountIndex("session-a", 1_500)).toBeNull();
+		store.rememberWithVersion("session-a", 1, 2_000, next);
+		expect(store.getPreferredAccountIndex("session-a", 2_500)).toBe(1);
+	});
+
 	it("generates distinct default write versions for same-timestamp overlaps", () => {
 		vi.useFakeTimers();
 		vi.setSystemTime(new Date("2026-04-06T00:00:00.000Z"));
