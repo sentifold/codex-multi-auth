@@ -247,7 +247,7 @@ Common operator overrides (aligned with
 - `CODEX_MULTI_AUTH_DIR` — move the whole multi-auth root
 - `CODEX_MULTI_AUTH_CONFIG_PATH` — load config from an explicit file
 - `CODEX_MODE`
-- `CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY` — `0` disables the proxy for the current process
+- `CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY` — `0` disables the proxy for the current process; `1` requires it, so a proxy that cannot start fails the launch instead of forwarding on a single account
 - `CODEX_MULTI_AUTH_FORCE_ACCOUNT` — force one account for a single forwarded `codex-multi-auth-codex` run (selector: index/email/id); `--account` wins when both are set
 - `CODEX_MULTI_AUTH_APP_ROTATION_IDLE_MS`
 - `CODEX_MULTI_AUTH_APP_ROTATION_MAX_LIFETIME_MS` — absolute ceiling on a helper's life regardless of activity (default 24h; `0` disables)

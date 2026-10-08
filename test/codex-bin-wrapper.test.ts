@@ -441,6 +441,37 @@ function createRuntimeRotationProxyFixtureModule(fixtureRoot: string): string {
 	return modulePath;
 }
 
+// A runtime rotation proxy whose startup always throws, e.g. it cannot bind.
+function createFailingRuntimeRotationProxyFixtureModule(fixtureRoot: string): void {
+	createRuntimeConfigTomlFixtureModule(fixtureRoot);
+	const distLibDir = join(fixtureRoot, "dist", "lib");
+	mkdirSync(distLibDir, { recursive: true });
+	writeFileSync(
+		join(distLibDir, "runtime-rotation-proxy.js"),
+		[
+			"export async function startRuntimeRotationProxy() {",
+			'  throw new Error("proxy bind failed");',
+			"}",
+		].join("\n"),
+		"utf8",
+	);
+}
+
+// Stands in for `dist/lib/config.js` with rotation enabled by the stored or
+// default setting, so the wrapper turns rotation on without the env override.
+function createRotationEnabledConfigFixtureModule(fixtureRoot: string): void {
+	const distLibDir = join(fixtureRoot, "dist", "lib");
+	mkdirSync(distLibDir, { recursive: true });
+	writeFileSync(
+		join(distLibDir, "config.js"),
+		[
+			"export function loadPluginConfig() { return {}; }",
+			"export function getCodexRuntimeRotationProxy() { return true; }",
+		].join("\n"),
+		"utf8",
+	);
+}
+
 function createFakeCodexBin(rootDir: string): string {
 	const fakeBin = join(rootDir, "fake-codex.js");
 	writeFileSync(
@@ -1926,6 +1957,86 @@ describe("codex bin wrapper", () => {
 		);
 		expect(existsSync(markerPath)).toBe(false);
 		expect(result.stdout).not.toContain("FORWARDED:");
+	});
+
+	// An explicit `CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY=1` asks for rotation on
+	// this launch. If the proxy cannot be set up, forwarding anyway would put every
+	// request on the single active account while the operator believes the pool is
+	// rotating, so the launch must stop instead.
+	it.each([
+		{
+			failure: "config helpers are unavailable",
+			setup: (_fixtureRoot: string): void => {},
+			message:
+				"codex-multi-auth runtime rotation config helpers are unavailable; CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY explicitly requests rotation, so this launch will not continue on a single account.",
+		},
+		{
+			failure: "proxy module is unavailable",
+			setup: (fixtureRoot: string): void => {
+				createRuntimeConfigTomlFixtureModule(fixtureRoot);
+			},
+			message:
+				"codex-multi-auth runtime rotation proxy is unavailable; CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY explicitly requests rotation, so this launch will not continue on a single account.",
+		},
+		{
+			failure: "proxy fails to start",
+			setup: createFailingRuntimeRotationProxyFixtureModule,
+			message:
+				"codex-multi-auth runtime rotation proxy failed to start; CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY explicitly requests rotation, so this launch will not continue on a single account: proxy bind failed",
+		},
+	])(
+		"fails closed when rotation is explicitly requested and the $failure",
+		({ setup, message }) => {
+			const fixtureRoot = createWrapperFixture();
+			setup(fixtureRoot);
+			const fakeBin = createFakeCodexBin(fixtureRoot);
+			const originalHome = join(fixtureRoot, "codex-home");
+			mkdirSync(originalHome, { recursive: true });
+			writeFileSync(
+				join(originalHome, "config.toml"),
+				'model_provider = "openai"\n',
+				"utf8",
+			);
+
+			const result = runWrapper(fixtureRoot, ["exec", "status"], {
+				CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
+				CODEX_HOME: originalHome,
+				CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
+			});
+
+			expect(result.status).toBe(1);
+			expect(result.stderr).toContain(message);
+			expect(result.stderr).not.toContain("continuing without runtime rotation");
+			expect(result.stdout).not.toContain("FORWARDED:");
+		},
+	);
+
+	it("keeps forwarding without rotation when default-on rotation cannot start", () => {
+		// Without the explicit env opt-in, rotation is on only through the stored
+		// or default setting, and a proxy that cannot start still degrades to a
+		// direct forward with a warning, as before.
+		const fixtureRoot = createWrapperFixture();
+		createRotationEnabledConfigFixtureModule(fixtureRoot);
+		createFailingRuntimeRotationProxyFixtureModule(fixtureRoot);
+		const fakeBin = createFakeCodexBin(fixtureRoot);
+		const originalHome = join(fixtureRoot, "codex-home");
+		mkdirSync(originalHome, { recursive: true });
+		writeFileSync(
+			join(originalHome, "config.toml"),
+			'model_provider = "openai"\n',
+			"utf8",
+		);
+
+		const result = runWrapper(fixtureRoot, ["exec", "status"], {
+			CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
+			CODEX_HOME: originalHome,
+		});
+
+		expect(result.status).toBe(0);
+		expect(result.stderr).toContain(
+			"codex-multi-auth runtime rotation proxy failed to start; continuing without runtime rotation: proxy bind failed",
+		);
+		expect(result.stdout).toContain("FORWARDED:exec status");
 	});
 
 	it("starts the opt-in runtime rotation proxy with a shadow CODEX_HOME provider", () => {

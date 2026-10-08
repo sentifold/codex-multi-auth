@@ -5619,6 +5619,19 @@ async function createRuntimeRotationProxyContextIfEnabled(
 		return baseContext;
 	}
 
+	// `CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY=1` is an explicit request for
+	// rotation on this launch, not the default-on setting. If the proxy cannot be
+	// set up, continuing would send every request through whichever single
+	// account is active, which looks like working rotation until that account's
+	// quota is gone. Fail closed for the explicit request only; rotation that is
+	// merely on by default keeps the warn-and-continue fallback below.
+	const rotationExplicitlyRequested =
+		parseRuntimeRotationProxyEnv(
+			baseContext.env.CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY,
+		) === true;
+	const singleAccountFallbackRefusal =
+		"CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY explicitly requests rotation, so this launch will not continue on a single account";
+
 	const configTomlModule = await loadRuntimeConfigTomlModule();
 	if (!configTomlModule) {
 		if (requireConfiguredUpstream) {
@@ -5626,6 +5639,12 @@ async function createRuntimeRotationProxyContextIfEnabled(
 			return {
 				startupError:
 					"codex-multi-auth runtime rotation config helpers are unavailable; configured upstream routing cannot continue.",
+			};
+		}
+		if (rotationExplicitlyRequested) {
+			baseContext.cleanup?.();
+			return {
+				startupError: `codex-multi-auth runtime rotation config helpers are unavailable; ${singleAccountFallbackRefusal}.`,
 			};
 		}
 		console.error(
@@ -5704,6 +5723,12 @@ async function createRuntimeRotationProxyContextIfEnabled(
 					"codex-multi-auth runtime rotation proxy is unavailable; configured upstream routing cannot continue.",
 			};
 		}
+		if (rotationExplicitlyRequested) {
+			baseContext.cleanup?.();
+			return {
+				startupError: `codex-multi-auth runtime rotation proxy is unavailable; ${singleAccountFallbackRefusal}.`,
+			};
+		}
 		console.error(
 			"codex-multi-auth runtime rotation proxy is unavailable; continuing without runtime rotation.",
 		);
@@ -5736,6 +5761,14 @@ async function createRuntimeRotationProxyContextIfEnabled(
 			baseContext.cleanup?.();
 			return {
 				startupError: `codex-multi-auth runtime rotation proxy failed to start with configured upstream: ${
+					error instanceof Error ? error.message : String(error)
+				}`,
+			};
+		}
+		if (rotationExplicitlyRequested) {
+			baseContext.cleanup?.();
+			return {
+				startupError: `codex-multi-auth runtime rotation proxy failed to start; ${singleAccountFallbackRefusal}: ${
 					error instanceof Error ? error.message : String(error)
 				}`,
 			};
