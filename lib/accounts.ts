@@ -1593,7 +1593,8 @@ export class AccountManager {
 	 * For each account, if the on-disk copy of the same identity carries a
 	 * strictly newer token (later expiresAt), adopt the disk's token material.
 	 * Our own freshly-refreshed tokens always have the newest expiry, so this
-	 * never undoes a refresh we just performed.
+	 * never undoes a refresh we just performed. This only changes the snapshot;
+	 * `adoptPersistedTokens` updates the live pool from what was persisted.
 	 */
 	private reconcileTokensFromDisk(
 		snapshot: AccountStorageV3,
@@ -1648,6 +1649,52 @@ export class AccountManager {
 			}
 		}
 		return snapshot;
+	}
+
+	/**
+	 * Adopt a token another process rotated into the live account once this
+	 * write has persisted it. Otherwise a long-lived manager keeps presenting
+	 * the rotated-away token, and its next refresh sends a single-use refresh
+	 * token that was already spent while the store holds a working one.
+	 *
+	 * `persisted` is what was written. Rows match by record id only: the
+	 * identity reconcile above also matches a record that was removed and
+	 * logged in again, which must keep its own token chain. The expiry is
+	 * compared after the write, so a refresh committed meanwhile is never
+	 * rolled back. Only the token fields move; cooldowns, rate limits,
+	 * invalidation and routing state stay as they are.
+	 */
+	private adoptPersistedTokens(persisted: AccountStorageV3): void {
+		// Stored rows always carry a refresh token; tolerate one that does not
+		// rather than throw after the write has already succeeded.
+		const recordIdOf = (row: AccountStorageV3["accounts"][number]) =>
+			typeof row.refreshToken === "string" ? resolveAccountRecordId(row) : row.recordId;
+		const saved = new Map(persisted.accounts.map((row) => [recordIdOf(row), row]));
+		for (const account of this.accounts) {
+			if (!account.recordId) continue;
+			const row = saved.get(account.recordId);
+			if (!row?.refreshToken) continue;
+			if ((row.expiresAt ?? 0) <= (account.expires ?? 0)) continue;
+			// A refresh token is single-use, so it belongs to one record. If the
+			// written pool also holds it under another record, the identity
+			// reconcile copied it there (possible before the first save stamps
+			// record ids); keep this record's own token rather than guess.
+			if (persisted.accounts.some((other) => other !== row && other.refreshToken === row.refreshToken)) continue;
+			const tokens = {
+				refreshToken: row.refreshToken,
+				accessToken: row.accessToken,
+				expiresAt: row.expiresAt,
+			};
+			account.refreshToken = tokens.refreshToken;
+			account.access = tokens.accessToken;
+			account.expires = tokens.expiresAt;
+			// This is now known persisted state; a later rotation must merge
+			// against it rather than read as a concurrent edit.
+			const baselineRow = this.persistenceBaseline?.accounts.find(
+				(stored) => recordIdOf(stored) === account.recordId,
+			);
+			if (baselineRow) Object.assign(baselineRow, tokens);
+		}
 	}
 
 	/**
@@ -1844,7 +1891,9 @@ export class AccountManager {
 					this.clearAuthFailures(liveAccount);
 
 					try {
-						await this.persistSnapshot(_current, nextStorage, persist, storedAccount);
+						this.adoptPersistedTokens(
+							await this.persistSnapshot(_current, nextStorage, persist, storedAccount),
+						);
 						this.rememberWorkspaceSelections(nextStorage);
 					} catch (error) {
 						liveAccount.access = previousLiveAccountState.access;
@@ -1889,7 +1938,9 @@ export class AccountManager {
 					return liveAccount;
 				}
 
-				await this.persistSnapshot(_current, nextStorage, persist, storedAccount);
+				this.adoptPersistedTokens(
+					await this.persistSnapshot(_current, nextStorage, persist, storedAccount),
+				);
 				this.rememberWorkspaceSelections(nextStorage);
 				log.warn("Unable to resolve refreshed live account after persistence", {
 					sourceIndex: source.index,
@@ -2235,7 +2286,8 @@ export class AccountManager {
 		return account;
 	}
 
- private async persistSnapshot(current: AccountStorageV3 | null, proposed: AccountStorageV3, persist: (storage: AccountStorageV3) => Promise<void>, refreshed?: AccountStorageV3["accounts"][number], runtimeOnConflict = false): Promise<void> {
+ /** Merge `proposed` with the disk state, write it, and return what was written. */
+ private async persistSnapshot(current: AccountStorageV3 | null, proposed: AccountStorageV3, persist: (storage: AccountStorageV3) => Promise<void>, refreshed?: AccountStorageV3["accounts"][number], runtimeOnConflict = false): Promise<AccountStorageV3> {
   // Preserve initial/missing-store creation. An intentionally cleared store has
   // distinct metadata and must still win over this manager's stale inventory.
   let merged: AccountStorageV3;
@@ -2244,9 +2296,10 @@ export class AccountManager {
    merged = current ? mergeAccountSnapshot(this.persistenceBaseline, current, proposed) : proposed;
   } catch (error) {
    if (runtimeOnConflict && (error as NodeJS.ErrnoException).code === "ESTALE" && current && this.persistenceBaseline) {
-    await persist(mergeAccountRuntimeObservations(this.persistenceBaseline, current, proposed));
+    const observed = mergeAccountRuntimeObservations(this.persistenceBaseline, current, proposed);
+    await persist(observed);
     log.warn("Saved runtime observations; conflicting account edits remain pending and require reload or reconciliation.");
-    return;
+    return observed;
    }
    if ((error as NodeJS.ErrnoException).code !== "ESTALE" || !refreshed?.recordId || !current) throw error;
    // A rotated credential must not be discarded because an unrelated user edit
@@ -2295,6 +2348,7 @@ export class AccountManager {
    // clear must compare against it rather than the pre-refresh clear.
    if (saved && baseline) Object.assign(baseline, { coolingDownUntil: saved.coolingDownUntil, cooldownReason: saved.cooldownReason });
   }
+  return merged;
  }
 
 	async saveToDisk(runtimeOnConflict = false): Promise<void> {
@@ -2307,7 +2361,9 @@ export class AccountManager {
 				this.reconcileSelectionFromDisk();
 				this.syncWorkspaceSelections(current);
 				const snapshot = this.reconcileTokensFromDisk(this.buildStorageSnapshot(), current);
-				await this.persistSnapshot(current, snapshot, persist, undefined, runtimeOnConflict);
+				this.adoptPersistedTokens(
+					await this.persistSnapshot(current, snapshot, persist, undefined, runtimeOnConflict),
+				);
 				this.rememberWorkspaceSelections(snapshot);
 			});
 		});

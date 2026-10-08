@@ -373,3 +373,121 @@ describe("applyMonotonicAuthCooldown", () => {
 		).toBeGreaterThan(firstDeadline);
 	});
 });
+
+describe("credentials another process rotated", () => {
+	const ROTATED_EXPIRES = NOW + 7_200_000;
+
+	function rotatedOnDisk(expiresAt = ROTATED_EXPIRES): AccountStorageV3 {
+		return storageWith(expiresAt, {
+			accessToken: "access-rotated",
+			refreshToken: "refresh-rotated",
+		});
+	}
+
+	it("uses the rotated credential after a routine save instead of refreshing the spent token", async () => {
+		const accountManager = managerWith(STALE_EXPIRES);
+		const disk = rotatedOnDisk();
+		const persist = vi.fn().mockResolvedValue(undefined);
+		withAccountStorageTransactionMock.mockImplementation(async (handler) =>
+			handler(disk, persist),
+		);
+		// refresh-1 was spent by the process that rotated it.
+		queuedRefreshMock.mockResolvedValue({
+			type: "failed",
+			reason: "http_error",
+			statusCode: 401,
+			message: "refresh token already used",
+		});
+
+		await accountManager.saveToDisk();
+		const result = await ensureFreshAccessToken(refreshParams(accountManager));
+
+		expect(persist.mock.calls[0]?.[0].accounts[0]).toMatchObject({
+			accessToken: "access-rotated",
+			refreshToken: "refresh-rotated",
+		});
+		expect(queuedRefreshMock).not.toHaveBeenCalled();
+		expect(result).toMatchObject({ ok: true, accessToken: "access-rotated" });
+	});
+
+	it("recovers after one failed refresh when no save ran since the rotation", async () => {
+		const accountManager = managerWith(STALE_EXPIRES);
+		withAccountStorageTransactionMock.mockImplementation(async (handler) =>
+			handler(rotatedOnDisk(), async () => undefined),
+		);
+		queuedRefreshMock.mockResolvedValue({
+			type: "failed",
+			reason: "http_error",
+			statusCode: 401,
+			message: "refresh token already used",
+		});
+
+		// Nothing has saved since the rotation, so the spent token goes out once.
+		const failed = await ensureFreshAccessToken(refreshParams(accountManager));
+		expect(failed).toMatchObject({ ok: false });
+		expect(queuedRefreshMock).toHaveBeenCalledWith("refresh-1");
+
+		// The save that failure schedules adopts the rotated credential.
+		await accountManager.flushPendingSave();
+		queuedRefreshMock.mockClear();
+		const result = await ensureFreshAccessToken(refreshParams(accountManager));
+
+		expect(queuedRefreshMock).not.toHaveBeenCalled();
+		expect(result).toMatchObject({ ok: true, accessToken: "access-rotated" });
+	});
+
+	it("keeps the live credential when the save fails", async () => {
+		const accountManager = managerWith(FRESH_EXPIRES);
+		withAccountStorageTransactionMock.mockImplementation(async (handler) =>
+			handler(rotatedOnDisk(), async () => {
+				throw new Error("disk full");
+			}),
+		);
+
+		await expect(accountManager.saveToDisk()).rejects.toThrow("disk full");
+
+		expect(accountManager.getAccountByIndex(0)).toMatchObject({
+			access: "access-1",
+			refreshToken: "refresh-1",
+		});
+	});
+
+	it("does not roll back a refresh committed while the save was writing", async () => {
+		const accountManager = managerWith(FRESH_EXPIRES);
+		const account = refreshParams(accountManager).account;
+		withAccountStorageTransactionMock.mockImplementation(async (handler) =>
+			handler(rotatedOnDisk(), async () => {
+				accountManager.updateFromAuth(account, {
+					type: "oauth",
+					access: "access-latest",
+					refresh: "refresh-latest",
+					expires: NOW + 10_800_000,
+				});
+			}),
+		);
+
+		await accountManager.saveToDisk();
+
+		expect(account).toMatchObject({
+			access: "access-latest",
+			refreshToken: "refresh-latest",
+		});
+	});
+
+	it.each([0, -60_000])(
+		"keeps its own credential when the disk expiry is not newer (%i ms)",
+		async (offset) => {
+			const accountManager = managerWith(FRESH_EXPIRES);
+			withAccountStorageTransactionMock.mockImplementation(async (handler) =>
+				handler(rotatedOnDisk(FRESH_EXPIRES + offset), async () => undefined),
+			);
+
+			await accountManager.saveToDisk();
+
+			expect(accountManager.getAccountByIndex(0)).toMatchObject({
+				access: "access-1",
+				refreshToken: "refresh-1",
+			});
+		},
+	);
+});
