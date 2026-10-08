@@ -83,6 +83,7 @@ import {
 } from "./policy/runtime-policy.js";
 import { createUsageStreamScanner } from "./usage/usage-extraction.js";
 import {
+	getUnsupportedCodexModelInfo,
 	isModelAtCapacityError,
 	isWorkspaceDisabledError,
 } from "./request/fetch-helpers.js";
@@ -2629,16 +2630,27 @@ async function handleRequestInner(
 			if (isResponsesRequest && context.model && [400,403,404].includes(upstream.status)) {
     const errorBody = await readErrorBody(upstream,state.streamStallTimeoutMs,65536);
     let data:unknown;try {data=JSON.parse(errorBody);}catch {data=null;}
-    // Learning and rotating on capability rejections is native-only; other
-    // proxies forward the upstream 4xx as they always have.
-    const failure=state.nativeOpenai ? classifyCapabilityFailure(upstream.status,data) : null;
+    const structured=classifyCapabilityFailure(upstream.status,data);
+    // Learning from and rotating on structured capability rejections is
+    // native-only; other proxies forward those 4xx as they always have.
+    const learned=state.nativeOpenai ? structured : null;
+    // A model entitlement differs per account, so an unpinned request on any
+    // proxy also tries the rest of the pool with the same, unchanged body. That
+    // includes the ChatGPT backend's flat `{"detail":"... is not supported when
+    // using Codex with a ChatGPT account."}` 400, which has no structured code.
+    // Unless native learning applies, the rejection only moves this request and
+    // is not remembered, and a pinned request gets the upstream 4xx unchanged.
+    const entitlement=!isPinned && (structured==="model" || getUnsupportedCodexModelInfo(data).isUnsupported);
+    const failure=learned ?? (entitlement ? "model" : null);
     upstream=new Response(errorBody,{status:upstream.status,headers:upstream.headers});
     if(failure){
      lastCapabilityRejection={status:upstream.status,body:errorBody,headers:responseHeadersForClient(upstream.headers),account:refreshed.account};
-     const body=parseRequestBody(context.body);
-     const effort=isRecord(body?.reasoning)&&typeof body.reasoning.effort==="string"?body.reasoning.effort:undefined;
-     const tier=typeof body?.service_tier==="string"?body.service_tier:undefined;
-     (state.capabilityFailures??=new RuntimeCapabilityFailures(state.now)).record(requestScope?.id ?? catalogAccountKey(refreshed.account),context.model,failure,effort,tier);
+     if(learned){
+      const body=parseRequestBody(context.body);
+      const effort=isRecord(body?.reasoning)&&typeof body.reasoning.effort==="string"?body.reasoning.effort:undefined;
+      const tier=typeof body?.service_tier==="string"?body.service_tier:undefined;
+      (state.capabilityFailures??=new RuntimeCapabilityFailures(state.now)).record(requestScope?.id ?? catalogAccountKey(refreshed.account),context.model,learned,effort,tier);
+     }
      rejectedWorkspaces.add(accountId);capabilityRejectionIsLatest=true;
      if(pendingScopes && pendingScopes.length>1){
       pendingScopes.shift();attemptedIndexes.delete(refreshed.account.index);refundConsumedPoolToken(refreshed.account);state.status.retries++;continue;

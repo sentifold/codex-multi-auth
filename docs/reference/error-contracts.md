@@ -154,6 +154,27 @@ that shape plus `pinnedAccountIndex`, a structured `reason` (for example
 `network-error`, `server-error`, or `null` when none was recorded), and a
 human-readable `message` that appends the blocker in parentheses (issue #486).
 
+**Model entitlement rejections:** when an account's plan does not include the
+requested model (the ChatGPT backend's `... is not supported when using Codex
+with a ChatGPT account` 400, or a structured code such as
+`model_not_supported`), an unpinned Responses request is retried on the next
+account with the same request body, trying each workspace once. The proxy never
+substitutes a different model on this path. When every account it tried rejects
+the model, the last upstream rejection is forwarded unchanged instead of
+`codex_runtime_rotation_pool_exhausted`. That also happens while the only
+entitled account is skipped as rate-limited or cooling down. If an account tried
+after the rejection answers 429 or fails transiently, the client gets
+`codex_runtime_rotation_pool_exhausted` instead. A pinned request never moves to
+another account and receives the upstream rejection, except that a `--native`
+app bind answers a structured capability code with
+`pinned_model_capability_rejected`. Only those structured codes feed native
+catalog routing; the ChatGPT backend's unstructured rejection is never
+remembered, so a later request can try a non-entitled account first again.
+Rejected `reasoning.effort` or `service_tier` values rotate only under a
+`--native` app bind. Once the rejection reaches the `codex-multi-auth-codex`
+wrapper, its own unsupported-model retry can still re-run Codex with a fallback
+model when it captures Codex output.
+
 **Pinned retry budget:** for pinned requests the attempt budget is
 `min(retryAllAccountsMaxRetries + 1, 4)` with 250ms/500ms/1s backoff, not the
 raw setting — each retry is another copy of the same non-idempotent request to

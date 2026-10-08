@@ -5436,6 +5436,98 @@ describe("request-level capability rejections",()=>{
  });
 });
 
+describe("account model entitlement rejections",()=>{
+ const model="gpt-6-astra";
+ const detail=`The '${model}' model is not supported when using Codex with a ChatGPT account.`;
+ const planRejection=()=>Response.json({detail},{status:400});
+ const structuredRejection=()=>Response.json({error:{code:"model_not_supported",message:"Model fixture is not available"}},{status:403});
+ const pinFirstAccount=()=>vi.spyOn(storageMetaModule,"readStorageMetaFromDisk").mockReturnValue({pinnedAccountIndex:0,affinityGeneration:1});
+ const start=async(respond:(n:number)=>Response,options:Partial<Parameters<typeof startRuntimeRotationProxy>[0]>={})=>{
+  const manager=new AccountManager(undefined,createStorage(Date.now(),2));let n=0;
+  const {calls,fetchImpl}=createRecordingFetch(call=>call.url.includes("/models")?Response.json({models:[{slug:model}]}):respond(++n));
+  const proxy=await startProxy({accountManager:manager,fetchImpl,options});
+  const inference=()=>calls.filter(c=>c.url.endsWith("/responses"));
+  return {
+   send:()=>postResponses(proxy,{model,input:"fixture"}),
+   accounts:()=>inference().map(c=>c.headers.get(OPENAI_HEADERS.ACCOUNT_ID)),
+   models:()=>inference().map(c=>JSON.parse(c.bodyText).model),
+  };
+ };
+ const run=async(respond:(n:number)=>Response,options:Partial<Parameters<typeof startRuntimeRotationProxy>[0]>={})=>{
+  const proxy=await start(respond,options);
+  const response=await proxy.send();
+  return {response,accounts:proxy.accounts(),models:proxy.models()};
+ };
+ it.each([
+  ["the ChatGPT plan rejection",planRejection],
+  ["a structured unsupported-model code",structuredRejection],
+ ])("retries %s on another account with the same model on a non-native proxy",async(_label,reject)=>{
+  const {response,accounts,models}=await run(n=>n===1?reject():textEventStream());
+  expect(response.status).toBe(200);await response.text();
+  expect(accounts).toHaveLength(2);
+  expect(new Set(accounts).size).toBe(2);
+  expect(models).toEqual([model,model]);
+ });
+ it("retries the ChatGPT plan rejection on another account on a native proxy",async()=>{
+  const {response,accounts,models}=await run(n=>n===1?planRejection():textEventStream(),{nativeOpenai:true});
+  expect(response.status).toBe(200);await response.text();
+  expect(new Set(accounts).size).toBe(2);
+  expect(models).toEqual([model,model]);
+ });
+ it("forwards the last upstream rejection when no account has the model",async()=>{
+  const {response,accounts,models}=await run(()=>planRejection());
+  expect(response.status).toBe(400);
+  expect(await response.json()).toEqual({detail});
+  expect(new Set(accounts).size).toBe(2);
+  expect(models).toEqual([model,model]);
+ });
+ it("reports pool exhaustion when the account tried after a model rejection is rate limited",async()=>{
+  const {response,accounts}=await run(n=>n===1?planRejection():new Response(JSON.stringify({error:{code:"rate_limit_exceeded"}}),{status:429,headers:{"content-type":"application/json","retry-after":"30"}}));
+  const body=await response.json();
+  expect(body.error.code).toBe("codex_runtime_rotation_pool_exhausted");
+  expect(body.error.reason).toBe("rate-limit");
+  expect(new Set(accounts).size).toBe(2);
+ });
+ it("keeps a pinned non-native request on its account",async()=>{
+  pinFirstAccount();
+  const {response,accounts}=await run(()=>planRejection());
+  expect(response.status).toBe(400);
+  expect(await response.json()).toEqual({detail});
+  expect(accounts).toEqual(["acc_1"]);
+ });
+ it("forwards the ChatGPT plan rejection to a pinned native request every time",async()=>{
+  pinFirstAccount();
+  const proxy=await start(()=>planRejection(),{nativeOpenai:true});
+  for(let i=0;i<2;i++){
+   const response=await proxy.send();
+   expect(response.status).toBe(400);
+   expect(await response.json()).toEqual({detail});
+  }
+  expect(proxy.accounts()).toEqual(["acc_1","acc_1"]);
+ });
+ it("does not remember the ChatGPT plan rejection on a native proxy",async()=>{
+  const proxy=await start(()=>planRejection(),{nativeOpenai:true});
+  for(let i=0;i<2;i++){
+   const response=await proxy.send();
+   expect(response.status).toBe(400);
+   expect(await response.json()).toEqual({detail});
+  }
+  expect(proxy.accounts()).toHaveLength(4);
+  expect(new Set(proxy.accounts()).size).toBe(2);
+ });
+ it("still answers and remembers a structured rejection under a native pin",async()=>{
+  pinFirstAccount();
+  const proxy=await start(()=>structuredRejection(),{nativeOpenai:true});
+  const first=await proxy.send();
+  expect(first.status).toBe(403);
+  expect((await first.json()).error.code).toBe("pinned_model_capability_rejected");
+  const repeat=await proxy.send();
+  expect(repeat.status).toBe(403);
+  expect((await repeat.json()).error.code).toBe("model_not_available_in_account_catalog");
+  expect(proxy.accounts()).toEqual(["acc_1"]);
+ });
+});
+
 describe('earned reset last-resort integration',()=>{
  it('never redeems or moves traffic off a stored native pin',async()=>{
   vi.spyOn(storageMetaModule,"readStorageMetaFromDisk").mockReturnValue({pinnedAccountIndex:0,affinityGeneration:1});

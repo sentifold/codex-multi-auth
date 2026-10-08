@@ -197,6 +197,9 @@ Existing account priority and account-policy restrictions still apply. A strict
 account pin confines this search to that account. Structured runtime capability
 rejections are remembered per workspace and may retry another eligible workspace
 before another account; accepted generation is never replayed by this mechanism.
+The ChatGPT backend's unstructured plan rejection (`... is not supported when
+using Codex with a ChatGPT account`) is not remembered; it only moves the current
+unpinned request to the next workspace.
 API and ZDR pools retain their separate credential routing and privacy boundaries.
 
 The local report labels the stored binding, preferred workspace, and routing

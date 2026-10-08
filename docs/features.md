@@ -41,7 +41,7 @@ On by default for request-bearing Codex sessions launched through `codex-multi-a
 
 | Feature | Notes |
 | --- | --- |
-| Per-request rotation | Moves to another account on rate limits, token expiry, network, or server failures — before response bytes stream |
+| Per-request rotation | Moves to another account on rate limits, token expiry, network, or server failures, or when the account's plan does not include the requested model (the proxy never swaps the model) — before response bytes stream |
 | Selection scoring | Weighs account health, quota headroom, time since last use, and model capability |
 | Session affinity | The same conversation stays on one account where it can |
 | Per-run force-pin | `codex-multi-auth-codex --account <index\|email\|id>` — ephemeral, fail-hard |
