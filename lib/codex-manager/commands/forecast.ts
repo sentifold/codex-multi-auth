@@ -14,6 +14,7 @@ import {
 	type RefreshedAccountPatch,
 } from "../forecast-report-shared.js";
 import type { QuotaCacheData } from "../../quota-cache.js";
+import { isCodexUnavailableError } from "../../errors.js";
 import { type CodexQuotaSnapshot, describeCodexProbeFailure } from "../../quota-probe.js";
 import {
 	DEFAULT_PROBE_MODEL,
@@ -75,6 +76,7 @@ export interface ForecastCommandDeps {
 		accountId: string;
 		accessToken: string;
 		model: string;
+		fallbackModels?: readonly string[];
 	}) => Promise<CodexQuotaSnapshot>;
 	normalizeFailureDetail: (
 		message: string | undefined,
@@ -98,6 +100,7 @@ export interface ForecastCommandDeps {
 			runtimeOverlay?: RuntimeForecastOverlay | null;
 			family?: ModelFamily;
 			model?: string | null;
+			unavailableModel?: string;
 		}>,
 	) => ForecastAccountResult[];
 	summarizeForecast: (results: ForecastAccountResult[]) => {
@@ -149,7 +152,7 @@ function printForecastUsage(logInfo: (message: string) => void): void {
 			"  --live, -l         Probe live quota headers via Codex backend",
 			"  --json, -j         Print machine-readable JSON output",
 			"  --explain          Include structured recommendation reasoning",
-			`  --model, -m        Probe model for live mode (default: ${DEFAULT_PROBE_MODEL})`,
+			`  --model, -m        Model to forecast; an explicit model is probed alone (default: ${DEFAULT_PROBE_MODEL})`,
 			"  --no-runtime-overlay  Ignore persisted runtime skip diagnostics",
 		].join("\n"),
 	);
@@ -263,6 +266,7 @@ export async function runForecastCommand(
 	const refreshFailures = new Map<number, TokenFailure>();
 	const liveQuotaByIndex = new Map<number, CodexQuotaSnapshot>();
 	const probeErrors: string[] = [];
+	const modelUnavailableIndexes = new Set<number>();
 
 	for (let i = 0; i < storage.accounts.length; i += 1) {
 		const account = storage.accounts[i];
@@ -356,6 +360,10 @@ export async function runForecastCommand(
 				accountId: probeAccountId,
 				accessToken: probeAccessToken,
 				model: probeModel,
+				// An explicit --model asks whether each account can serve that
+				// model. The default chain would answer with a fallback model's
+				// 200 for an account that rejects it, hiding the rejection.
+				...(options.modelProvided ? { fallbackModels: [] } : {}),
 			});
 			liveQuotaByIndex.set(i, liveQuota);
 			if (workingQuotaCache) {
@@ -372,9 +380,16 @@ export async function runForecastCommand(
 				}
 			}
 		} catch (error) {
-			const message = describeCodexProbeFailure(error, (raw) =>
-				deps.normalizeFailureDetail(raw, undefined),
-			);
+			// With only the requested model probed, a rejection says the account
+			// cannot serve that model, not that it lacks Codex altogether.
+			const modelUnavailable =
+				options.modelProvided && isCodexUnavailableError(error);
+			if (modelUnavailable) modelUnavailableIndexes.add(i);
+			const message = modelUnavailable
+				? `${probeModel} not available for this account`
+				: describeCodexProbeFailure(error, (raw) =>
+						deps.normalizeFailureDetail(raw, undefined),
+					);
 			probeErrors.push(`${deps.formatAccountLabel(account, i)}: ${message}`);
 		}
 	}
@@ -403,6 +418,9 @@ export async function runForecastCommand(
 		runtimeOverlay,
 		family: forecastFamily,
 		model: forecastModel,
+		unavailableModel: modelUnavailableIndexes.has(index)
+			? probeModel
+			: undefined,
 	}));
 	const forecastResults = deps.evaluateForecastAccounts(forecastInputs);
 	const summary = deps.summarizeForecast(forecastResults);
@@ -429,6 +447,7 @@ export async function runForecastCommand(
 				{
 					command: "forecast",
 					model: requestedModel,
+					probeModel,
 					liveProbe: options.live,
 					runtimeOverlay: options.runtimeOverlay,
 					summary,
@@ -451,7 +470,7 @@ export async function runForecastCommand(
 
 	logInfo(
 		deps.stylePromptText(
-			`Best-account preview (${storage.accounts.length} account(s), model ${requestedModel}, live check ${options.live ? "on" : "off"})`,
+			`Best-account preview (${storage.accounts.length} account(s), model ${requestedModel}${requestedModel !== probeModel ? ` -> ${probeModel}` : ""}, live check ${options.live ? "on" : "off"})`,
 			"accent",
 		),
 	);

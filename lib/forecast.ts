@@ -44,6 +44,12 @@ export interface ForecastAccountInput {
 	 * sibling model's record would be read as gating this one.
 	 */
 	model?: string | null;
+	/**
+	 * Model a live probe of exactly that model found this account cannot serve
+	 * (the backend rejected it as unsupported for the account). Such an account
+	 * is unavailable for the forecast whatever quota it has left.
+	 */
+	unavailableModel?: string;
 }
 
 export interface RuntimeForecastOverlay {
@@ -228,6 +234,12 @@ export function evaluateForecastAccount(
 			riskScore += 25;
 			reasons.push(`refresh warning: ${detail}`);
 		}
+	}
+
+	if (input.unavailableModel) {
+		availability = "unavailable";
+		riskScore += 95;
+		reasons.push(`${input.unavailableModel} not available for this account`);
 	}
 
 	if (

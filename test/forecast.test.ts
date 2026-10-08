@@ -78,6 +78,51 @@ describe("forecast helpers", () => {
 		).toBe(true);
 	});
 
+	it("never recommends an account that cannot serve the forecast model", () => {
+		const now = 1_700_000_000_000;
+		const account = {
+			refreshToken: "refresh-1",
+			addedAt: now - 10_000,
+			lastUsed: now - 10_000,
+		};
+		const results = evaluateForecastAccounts([
+			{
+				index: 0,
+				now,
+				isCurrent: false,
+				account,
+				model: "gpt-6-luna",
+				liveQuota: {
+					status: 200,
+					model: "gpt-6-luna",
+					primary: { usedPercent: 85, windowMinutes: 300 },
+					secondary: { usedPercent: 40, windowMinutes: 10_080 },
+				},
+			},
+			{
+				index: 1,
+				now,
+				isCurrent: true,
+				account: { ...account, refreshToken: "refresh-2" },
+				model: "gpt-6-luna",
+				unavailableModel: "gpt-6-luna",
+			},
+		]);
+
+		expect(results[1]).toMatchObject({
+			availability: "unavailable",
+			riskLevel: "high",
+			reasons: ["gpt-6-luna not available for this account"],
+			hardFailure: false,
+		});
+		expect(summarizeForecast(results)).toMatchObject({
+			ready: 1,
+			unavailable: 1,
+		});
+		expect(recommendForecastAccount(results).recommendedIndex).toBe(0);
+		expect(recommendForecastAccount(results.slice(1)).recommendedIndex).toBeNull();
+	});
+
 	it("marks quota-cache exhausted accounts as delayed instead of ready", () => {
 		const now = 1_700_000_000_000;
 		const account = {

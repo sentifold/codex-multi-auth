@@ -254,6 +254,29 @@ applies session affinity and the ephemeral `--account` override. Use
 
 ---
 
+## `codex-multi-auth forecast`
+
+Rank accounts by readiness and risk without switching:
+
+```console
+codex-multi-auth forecast --live --json --model gpt-6-luna
+```
+
+`--model` is normalized the way a routed request is: aliases, effort suffixes
+and retired ids resolve to the model the backend serves, and an id nothing
+recognizes resolves to the general routing default. The text header shows
+`requested -> normalized` when the two differ, and `--json` reports the
+normalized id as `probeModel` next to `model`.
+
+Without `--model`, `--live` asks for the default probe model and may fall back
+through the built-in probe chain; each account's `liveQuota.model` names the
+model that answered. An explicit `--model` is probed alone, so the forecast
+answers for that model: an account that rejects it is marked `unavailable` with
+the reason `<model> not available for this account` (also listed in
+`probeErrors`) and is never recommended.
+
+---
+
 ## `codex-multi-auth workspace`
 
 ```bash

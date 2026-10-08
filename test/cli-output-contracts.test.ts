@@ -549,6 +549,7 @@ describe("cli output contracts", () => {
 				"liveProbe",
 				"model",
 				"probeErrors",
+				"probeModel",
 				"recommendation",
 				"runtimeOverlay",
 				"summary",
@@ -556,6 +557,7 @@ describe("cli output contracts", () => {
 
 			expect(payload.command).toBe("forecast");
 			expect(payload.model).toBeTypeOf("string");
+			expect(payload.probeModel).toBe(payload.model);
 			expect(payload.liveProbe).toBe(false);
 			expect(payload.runtimeOverlay).toBe(true);
 			expect(payload.probeErrors).toEqual([]);
@@ -633,6 +635,7 @@ describe("cli output contracts", () => {
 				"liveProbe",
 				"model",
 				"probeErrors",
+				"probeModel",
 				"recommendation",
 				"runtimeOverlay",
 				"summary",

@@ -1,11 +1,28 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+// The real quota probe fetches model instructions before each request; keep
+// that offline so the probe can run end to end against a stubbed fetch.
+vi.mock("../lib/prompts/codex.js", async (importOriginal) => ({
+	...(await importOriginal<typeof import("../lib/prompts/codex.js")>()),
+	getCodexInstructions: vi.fn(async () => "instructions"),
+}));
+
 import {
 	type ForecastCommandDeps,
 	runForecastCommand,
 } from "../lib/codex-manager/commands/forecast.js";
 import { CodexUnavailableError } from "../lib/errors.js";
-import { CODEX_UNAVAILABLE_PROBE_NOTE } from "../lib/quota-probe.js";
 import {
+	CODEX_UNAVAILABLE_PROBE_NOTE,
+	fetchCodexQuotaSnapshot,
+} from "../lib/quota-probe.js";
+import {
+	evaluateForecastAccounts,
+	recommendForecastAccount,
+	summarizeForecast,
+} from "../lib/forecast.js";
+import {
+	DEFAULT_MODEL,
 	DEFAULT_PROBE_MODEL,
 	getModelProfile,
 	resolveNormalizedModel,
@@ -449,6 +466,226 @@ describe("runForecastCommand", () => {
 			),
 		).toBe(true);
 		expect(jsonLine).not.toContain("is not supported when using Codex");
+	});
+});
+
+describe("runForecastCommand with an explicit --model", () => {
+	function parseJsonReport(deps: ReturnType<typeof createDeps>) {
+		const line = (deps.logInfo as ReturnType<typeof vi.fn>).mock.calls
+			.map((call) => String(call[0]))
+			.find((entry) => entry.includes('"command": "forecast"'));
+		expect(line).toBeDefined();
+		return JSON.parse(line as string) as {
+			model: string;
+			probeModel: string;
+			probeErrors: string[];
+			summary: { ready: number; unavailable: number };
+			recommendation: { recommendedIndex: number | null };
+			accounts: Array<{
+				availability: string;
+				reasons: string[];
+				liveQuota?: { model: string };
+			}>;
+		};
+	}
+
+	function evaluationInputs(deps: ReturnType<typeof createDeps>) {
+		return vi.mocked(deps.evaluateForecastAccounts).mock.calls.at(-1)?.[0];
+	}
+
+	it("probes exactly the requested model and reports the normalized probe id", async () => {
+		const deps = createDeps({
+			fetchCodexQuotaSnapshot: vi.fn(async (input) => ({
+				status: 200,
+				model: input.model,
+				primary: { usedPercent: 11, windowMinutes: 300 },
+				secondary: { usedPercent: 22, windowMinutes: 10_080 },
+			})),
+		});
+
+		await expect(
+			runForecastCommand(["--live", "--json", "--model", "gpt-6-luna-high"], deps),
+		).resolves.toBe(0);
+
+		expect(deps.fetchCodexQuotaSnapshot).toHaveBeenCalledWith(
+			expect.objectContaining({ model: "gpt-6-luna", fallbackModels: [] }),
+		);
+		expect(parseJsonReport(deps)).toMatchObject({
+			model: "gpt-6-luna-high",
+			probeModel: "gpt-6-luna",
+			probeErrors: [],
+		});
+		expect(evaluationInputs(deps)?.[0]?.unavailableModel).toBeUndefined();
+	});
+
+	it("keeps the default fallback chain and Codex-unavailable note for a bare live forecast", async () => {
+		const deps = createDeps({
+			fetchCodexQuotaSnapshot: vi.fn(async () => {
+				throw new CodexUnavailableError("no probe model is supported");
+			}),
+		});
+
+		await expect(runForecastCommand(["--live", "--json"], deps)).resolves.toBe(0);
+
+		const input = vi.mocked(deps.fetchCodexQuotaSnapshot).mock.calls[0]?.[0];
+		expect(input?.model).toBe(DEFAULT_PROBE_MODEL);
+		expect(input).not.toHaveProperty("fallbackModels");
+		const report = parseJsonReport(deps);
+		expect(report).toMatchObject({
+			model: DEFAULT_PROBE_MODEL,
+			probeModel: DEFAULT_PROBE_MODEL,
+		});
+		expect(report.probeErrors).toEqual([
+			`1. forecast@example.com: ${CODEX_UNAVAILABLE_PROBE_NOTE}`,
+		]);
+		expect(evaluationInputs(deps)?.[0]?.unavailableModel).toBeUndefined();
+	});
+
+	it("shows the remap when an unrecognized model resolves to the default", async () => {
+		const deps = createDeps();
+
+		await expect(
+			runForecastCommand(["--model", "gpt-7-preview"], deps),
+		).resolves.toBe(0);
+		expect(deps.logInfo).toHaveBeenCalledWith(
+			expect.stringContaining(
+				`model gpt-7-preview -> ${DEFAULT_MODEL}, live check off`,
+			),
+		);
+
+		await expect(
+			runForecastCommand(["--live", "--json", "--model", "gpt-7-preview"], deps),
+		).resolves.toBe(0);
+		expect(deps.fetchCodexQuotaSnapshot).toHaveBeenLastCalledWith(
+			expect.objectContaining({ model: DEFAULT_MODEL, fallbackModels: [] }),
+		);
+		expect(parseJsonReport(deps)).toMatchObject({
+			model: "gpt-7-preview",
+			probeModel: DEFAULT_MODEL,
+		});
+	});
+
+	it("marks an account that rejects the model unavailable for it", async () => {
+		const deps = createDeps({
+			fetchCodexQuotaSnapshot: vi.fn(async () => {
+				throw new CodexUnavailableError(
+					"The 'gpt-6-luna' model is not supported when using Codex with a ChatGPT account.",
+				);
+			}),
+		});
+
+		await expect(
+			runForecastCommand(["--live", "--json", "--model", "gpt-6-luna"], deps),
+		).resolves.toBe(0);
+
+		expect(parseJsonReport(deps).probeErrors).toEqual([
+			"1. forecast@example.com: gpt-6-luna not available for this account",
+		]);
+		expect(evaluationInputs(deps)?.[0]?.unavailableModel).toBe("gpt-6-luna");
+	});
+
+	describe("against the real quota probe and forecast scoring", () => {
+		afterEach(() => {
+			vi.unstubAllGlobals();
+		});
+
+		function createTwoAccountStorage(): AccountStorageV3 {
+			const storage = createStorage();
+			const [base] = storage.accounts;
+			if (!base) throw new Error("fixture account missing");
+			storage.accounts = [
+				{ ...base, email: "entitled@example.com", accountId: "account-entitled" },
+				{ ...base, email: "rejecting@example.com", accountId: "account-rejecting" },
+			];
+			return storage;
+		}
+
+		function stubBackend(probes: Array<{ accountId: string | null; model: string }>) {
+			vi.stubGlobal(
+				"fetch",
+				vi.fn(async (_url: unknown, init?: RequestInit) => {
+					const accountId = new Headers(init?.headers).get("chatgpt-account-id");
+					const { model } = JSON.parse(String(init?.body)) as { model: string };
+					probes.push({ accountId, model });
+					if (accountId === "account-rejecting" && model === "gpt-6-luna") {
+						return new Response(
+							JSON.stringify({
+								detail: "The 'gpt-6-luna' model is not supported when using Codex with a ChatGPT account.",
+							}),
+							{ status: 400 },
+						);
+					}
+					// Quota headers are account-level: the rejecting account still
+					// answers any model it is entitled to, and its lower usage makes
+					// it the best pick if that answer is scored for gpt-6-luna.
+					const used = accountId === "account-rejecting" ? "10" : "75";
+					return new Response("", {
+						status: 200,
+						headers: {
+							"x-codex-primary-used-percent": used,
+							"x-codex-primary-window-minutes": "300",
+							"x-codex-secondary-used-percent": "10",
+							"x-codex-secondary-window-minutes": "10080",
+						},
+					});
+				}),
+			);
+		}
+
+		function createRealScoringDeps() {
+			return createDeps({
+				loadAccounts: vi.fn(async () => createTwoAccountStorage()),
+				formatAccountLabel: vi.fn(
+					(account, index) => `${index + 1}. ${account.email ?? "account"}`,
+				),
+				fetchCodexQuotaSnapshot,
+				evaluateForecastAccounts,
+				summarizeForecast,
+				recommendForecastAccount,
+			});
+		}
+
+		it("never recommends an account that cannot serve the requested model", async () => {
+			const probes: Array<{ accountId: string | null; model: string }> = [];
+			stubBackend(probes);
+			const deps = createRealScoringDeps();
+
+			await expect(
+				runForecastCommand(["--live", "--json", "--model", "gpt-6-luna"], deps),
+			).resolves.toBe(0);
+
+			// One request per account, for the requested model only.
+			expect(probes).toEqual([
+				{ accountId: "account-entitled", model: "gpt-6-luna" },
+				{ accountId: "account-rejecting", model: "gpt-6-luna" },
+			]);
+			const report = parseJsonReport(deps);
+			expect(report.probeErrors).toEqual([
+				"2. rejecting@example.com: gpt-6-luna not available for this account",
+			]);
+			expect(report.accounts[1]).toMatchObject({
+				availability: "unavailable",
+				reasons: ["gpt-6-luna not available for this account"],
+			});
+			expect(report.accounts[1]?.liveQuota).toBeUndefined();
+			expect(report.summary).toMatchObject({ ready: 1, unavailable: 1 });
+			expect(report.recommendation.recommendedIndex).toBe(0);
+		});
+
+		it("tells a user on the rejecting account to switch to the entitled one", async () => {
+			stubBackend([]);
+			const deps = createRealScoringDeps();
+			vi.mocked(deps.resolveActiveIndex).mockReturnValue(1);
+
+			await expect(
+				runForecastCommand(["--live", "--model", "gpt-6-luna"], deps),
+			).resolves.toBe(0);
+
+			const lines = vi.mocked(deps.logInfo).mock.calls.map((call) => String(call[0]));
+			expect(lines.some((line) => line.startsWith("Best next account: 1 ("))).toBe(true);
+			expect(lines).toContain("Switch now with: codex-multi-auth switch 1");
+			expect(lines.some((line) => line.includes("switch 2"))).toBe(false);
+		});
 	});
 });
 
