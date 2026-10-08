@@ -52,6 +52,8 @@ On by default for request-bearing Codex sessions launched through `codex-multi-a
 
 The proxy also forwards model discovery and image generation/edits. See [reference/image-routes.md](reference/image-routes.md) and [reference/imagegen-provider-compatibility.md](reference/imagegen-provider-compatibility.md) for image-specific behavior.
 
+It also forwards Codex's standalone web search (`POST /alpha/search`, plus `/codex/` and `/v1/` aliases) to `/codex/alpha/search` with the selected account's OAuth credentials and normal rotation. Codex uses this endpoint instead of the hosted `web_search` tool for Responses Lite models and when `features.standalone_web_search` is enabled. Usage ledger rows record operation `search`. See [reference/web-search-route.md](reference/web-search-route.md) for account affinity, rate-limit and refusal handling.
+
 ---
 
 ## Local Governance

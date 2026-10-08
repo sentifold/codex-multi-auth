@@ -31,6 +31,7 @@ The complete documentation set for `codex-multi-auth`, the multi-account OAuth m
 | [reference/public-api.md](reference/public-api.md) | Public API stability tiers and semver contract |
 | [reference/error-contracts.md](reference/error-contracts.md) | CLI, JSON, and helper error semantics |
 | [reference/image-routes.md](reference/image-routes.md) | Image generation/edit transport through the runtime proxy |
+| [reference/web-search-route.md](reference/web-search-route.md) | Standalone web search transport through the runtime proxy |
 | [reference/imagegen-provider-compatibility.md](reference/imagegen-provider-compatibility.md) | Built-in `image_gen` provider compatibility |
 | [Release history](#release-history) | Stable, previous, and archived release notes |
 

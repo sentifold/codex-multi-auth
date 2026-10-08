@@ -543,6 +543,123 @@ describe("runtime rotation proxy", () => {
 		expect(refreshAccessTokenMock).toHaveBeenCalledTimes(1);
 		expect(calls[0].headers.get("authorization")).toBe("Bearer fresh-image-access");
 	});
+	it.each(["/alpha/search", "/v1/alpha/search", "/codex/alpha/search", "/v1/codex/alpha/search"])("forwards standalone web search %s to the Codex backend through managed OAuth", async (path) => {
+		const accountManager = new AccountManager(undefined, createStorage(Date.now()));
+		// The body Codex's standalone `web.run` tool POSTs to `{base_url}/alpha/search`.
+		const payload = {
+			id: "search-session",
+			model: "gpt-5.6-sol",
+			commands: { search_query: [{ q: "codex multi auth" }] },
+			settings: { allowed_callers: ["direct"], external_web_access: true },
+			max_output_tokens: 2500,
+		};
+		const result = { encrypted_output: null, output: "search result", results: [] };
+		const { calls, fetchImpl } = createRecordingFetch(() => Response.json(result));
+		const proxy = await startProxy({ accountManager, fetchImpl });
+		const response = await postResponses(proxy, payload, path, {
+			cookie: "local-secret",
+			"x-openai-actor-authorization": "codex-multi-auth-local",
+		});
+		expect(response.status).toBe(200);
+		expect(await response.json()).toEqual(result);
+		expect(calls).toHaveLength(1);
+		expect(calls[0].url).toBe("https://example.test/backend-api/codex/alpha/search");
+		expect(calls[0].bodyText).toBe(JSON.stringify(payload));
+		expect(calls[0].headers.get("authorization")).toMatch(/^Bearer access-/);
+		expect(calls[0].headers.get(OPENAI_HEADERS.ACCOUNT_ID)).toMatch(/^acc_/);
+		expect(calls[0].headers.get("cookie")).toBeNull();
+		expect(calls[0].headers.has("x-openai-actor-authorization")).toBe(false);
+	});
+	it("records standalone web search under its own usage operation", async () => {
+		const accountManager = new AccountManager(undefined, createStorage(Date.now()));
+		const record = vi.fn(async () => undefined);
+		const recorder = vi.spyOn(runtimePolicy, "createRuntimeUsageRecorder")
+			.mockReturnValue({ hasRecorded: () => record.mock.calls.length > 0, record });
+		const { fetchImpl } = createRecordingFetch(() => Response.json({ output: "search result" }));
+		const proxy = await startProxy({ accountManager, fetchImpl });
+		const response = await postResponses(proxy, { model: "gpt-5.6-sol" }, "/alpha/search");
+		await response.text();
+		expect(response.status).toBe(200);
+		expect(recorder).toHaveBeenCalledWith(expect.objectContaining({ operation: "search", model: "gpt-5.6-sol" }));
+		await vi.waitFor(() => expect(record).toHaveBeenCalledWith(expect.objectContaining({ outcome: "success", statusCode: 200 })));
+	});
+	it("rotates standalone web search on an explicit quota rejection and cools the conversation model", async () => {
+		const accountManager = new AccountManager(undefined, createStorage(Date.now()));
+		const { calls, fetchImpl } = createRecordingFetch((_call, attempt) => attempt === 1
+			? new Response('{"error":{"code":"rate_limit_exceeded"}}', { status: 429 })
+			: Response.json({ output: "search result" }));
+		const proxy = await startProxy({ accountManager, fetchImpl });
+		const response = await postResponses(proxy, { model: "gpt-5.6-sol" }, "/alpha/search");
+		expect(response.status).toBe(200);
+		expect(await response.json()).toEqual({ output: "search result" });
+		expect(calls.map((call) => call.headers.get(OPENAI_HEADERS.ACCOUNT_ID))).toEqual(["acc_1", "acc_2"]);
+		// Unlike images (family "codex"), search shares the rate-limit family of
+		// the conversation model it names.
+		const limits = accountManager.getAccountByIndex(0)?.rateLimitResetTimes ?? {};
+		expect(limits[getModelFamily("gpt-5.6-sol")]).toBeTypeOf("number");
+		expect(limits.codex).toBeUndefined();
+	});
+	it("keeps standalone web search on the account that serves the conversation", async () => {
+		const accountManager = new AccountManager(undefined, createStorage(Date.now()));
+		const blockOnly = (index: number) => ({
+			allowed: true, statusCode: 200, errorCode: null, reasons: [], projectKey: null,
+			blockedAccountIndexes: new Set([index]), scoreBoostByAccount: {}, budgetEvaluations: [],
+		});
+		const policySpy = vi.spyOn(runtimePolicy, "evaluateRuntimePolicy")
+			.mockResolvedValueOnce(blockOnly(0))
+			.mockResolvedValueOnce(blockOnly(1));
+		const { calls, fetchImpl } = createRecordingFetch((call) => call.url.endsWith("/alpha/search")
+			? Response.json({ output: "search result" })
+			: textEventStream());
+		const proxy = await startProxy({ accountManager, fetchImpl });
+		// Codex uses its session id as the turn's prompt_cache_key and as the search body id.
+		for (const key of ["codex-session", "other-session"]) {
+			const turn = await postResponses(proxy, { model: "gpt-5.6-sol", stream: true, prompt_cache_key: key });
+			expect(turn.status).toBe(200);
+			await turn.text();
+		}
+		const search = await postResponses(proxy, { id: "codex-session", model: "gpt-5.6-sol" }, "/alpha/search");
+		expect(search.status).toBe(200);
+		await search.text();
+		expect(calls.map((call) => call.headers.get(OPENAI_HEADERS.ACCOUNT_ID))).toEqual(["acc_2", "acc_1", "acc_2"]);
+		policySpy.mockRestore();
+	});
+	it("passes a standalone web search refusal through without disabling accounts", async () => {
+		const accountManager = new AccountManager(undefined, createStorage(Date.now()));
+		const refusal = '{"error":{"message":"Your organization has disabled web search."}}';
+		const { calls, fetchImpl } = createRecordingFetch(() => new Response(refusal, {
+			status: HTTP_STATUS.FORBIDDEN,
+			headers: { "content-type": "application/json" },
+		}));
+		const proxy = await startProxy({ accountManager, fetchImpl });
+		const response = await postResponses(proxy, { model: "gpt-5.6-sol" }, "/alpha/search");
+		expect(response.status).toBe(HTTP_STATUS.FORBIDDEN);
+		expect(await response.text()).toBe(refusal);
+		expect(calls).toHaveLength(1);
+		expect(accountManager.getAccountByIndex(0)?.enabled).toBe(true);
+		expect(accountManager.getAccountByIndex(1)?.enabled).toBe(true);
+	});
+	it.each(["api/gpt-5.6-sol", "zdr/gpt-5.6-sol"])("refuses standalone web search for the %s route without an upstream call", async (model) => {
+		const accountManager = new AccountManager(undefined, createStorage(Date.now()));
+		const { calls, fetchImpl } = createRecordingFetch(() => Response.json({ output: "unused" }));
+		const proxy = await startProxy({ accountManager, fetchImpl });
+		const response = await postResponses(proxy, { model }, "/alpha/search");
+		expect(response.status).toBe(400);
+		expect((await response.json()).error.code).toBe("api_route_requires_responses");
+		expect(calls).toHaveLength(0);
+	});
+	it("accepts standalone web search only as POST", async () => {
+		const accountManager = new AccountManager(undefined, createStorage(Date.now()));
+		const { calls, fetchImpl } = createRecordingFetch(() => new Response("unused"));
+		const proxy = await startProxy({ accountManager, fetchImpl });
+		const response = await fetch(`${proxy.baseUrl}/alpha/search`, {
+			method: "GET",
+			headers: { authorization: `Bearer ${DEFAULT_CLIENT_API_KEY}` },
+		});
+		expect(response.status).toBe(404);
+		expect((await response.json()).error.code).toBe("runtime_rotation_proxy_not_found");
+		expect(calls).toHaveLength(0);
+	});
 	it("requires a client API key at startup", async () => {
 		const now = Date.now();
 		const accountManager = new AccountManager(undefined, createStorage(now));
@@ -955,7 +1072,7 @@ describe("runtime rotation proxy", () => {
 		expect(await authUnknownPath.json()).toEqual({
 			error: {
 				message:
-					"Runtime rotation proxy only accepts Responses API, images, model discovery, and Codex thread goal requests.",
+					"Runtime rotation proxy only accepts Responses API, images, standalone web search, model discovery, and Codex thread goal requests.",
 				code: "runtime_rotation_proxy_not_found",
 			},
 		});

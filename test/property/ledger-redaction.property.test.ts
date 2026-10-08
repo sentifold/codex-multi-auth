@@ -86,6 +86,7 @@ const arbAppendInput: fc.Arbitrary<UsageLedgerAppendInput> = fc.record(
 			fc.constantFrom(
 				"responses",
 				"images",
+				"search",
 				"models",
 				"thread-goal",
 				"auth-refresh",

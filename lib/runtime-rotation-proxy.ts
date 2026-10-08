@@ -526,6 +526,14 @@ const ALLOWED_IMAGE_PATHS = new Set([
 	"/v1/images/generations",
 	"/v1/images/edits",
 ]);
+// Codex's standalone web search tool POSTs `alpha/search` on the provider base
+// URL, so accept it under the same prefixes as Responses.
+const ALLOWED_SEARCH_PATHS = new Set([
+	"/alpha/search",
+	"/codex/alpha/search",
+	"/v1/alpha/search",
+	"/v1/codex/alpha/search",
+]);
 const ALLOWED_THREAD_GOAL_PATHS = new Set([
 	"/thread/goal/get",
 	"/thread/goal/set",
@@ -941,6 +949,30 @@ function buildImageRequestContext(
 	};
 }
 
+function buildSearchRequestContext(
+	req: IncomingMessage,
+	body: Buffer,
+): RequestContext {
+	const context = buildResponsesRequestContext(req, body);
+	const parsedBody = parseRequestBody(body);
+	// Codex sends no session header with a search. Its body `id` is the Codex
+	// session id, which is also the Responses `prompt_cache_key`, so keying
+	// affinity on it keeps a conversation's searches, and later open/click/find
+	// calls by `ref_id`, on the account that serves the conversation.
+	const searchSessionKey = parsedBody
+		? readStringRecordValue(parsedBody, "id")
+		: null;
+	// Unlike images, which pin family "codex", search keeps the family of the
+	// conversation model it names, so a search 429 also cools that model's
+	// family on the account. This assumes the endpoint draws on the same Codex
+	// usage limit as the conversation.
+	return {
+		...context,
+		upstreamPath: "/codex/alpha/search",
+		sessionKey: context.sessionKey ?? searchSessionKey,
+	};
+}
+
 function buildModelsRequestContext(req: IncomingMessage): RequestContext {
 	return {
 		body: Buffer.alloc(0),
@@ -1013,7 +1045,7 @@ function writeMethodOrPathError(res: ServerResponse): void {
 	writeJson(res, 404, {
 		error: {
 			message:
-				"Runtime rotation proxy only accepts Responses API, images, model discovery, and Codex thread goal requests.",
+				"Runtime rotation proxy only accepts Responses API, images, standalone web search, model discovery, and Codex thread goal requests.",
 			code: "runtime_rotation_proxy_not_found",
 		},
 	});
@@ -1445,12 +1477,14 @@ async function handleRequestInner(
 			req.method === "GET" && isModelsPath(incomingUrl.pathname);
 		const isImageRequest =
 			req.method === "POST" && ALLOWED_IMAGE_PATHS.has(incomingUrl.pathname);
+		const isSearchRequest =
+			req.method === "POST" && ALLOWED_SEARCH_PATHS.has(incomingUrl.pathname);
 		const isThreadGoalRequest =
 			(req.method === "GET" || req.method === "POST") &&
 			isThreadGoalPath(incomingUrl.pathname);
 		if (
 			!isResponsesRequest && !isModelsRequest &&
-			!isThreadGoalRequest && !isImageRequest
+			!isThreadGoalRequest && !isImageRequest && !isSearchRequest
 		) {
 			writeMethodOrPathError(res);
 			return;
@@ -1458,7 +1492,7 @@ async function handleRequestInner(
 
 		state.status.totalRequests += 1;
 		let requestBody =
-			isResponsesRequest || isImageRequest ||
+			isResponsesRequest || isImageRequest || isSearchRequest ||
 			(isThreadGoalRequest && req.method === "POST")
 				? await readRequestBody(req, state.maxRequestBodyBytes)
 				: Buffer.alloc(0);
@@ -1482,6 +1516,8 @@ async function handleRequestInner(
 				? buildThreadGoalRequestContext(req, requestBody, incomingUrl.pathname)
 				: isImageRequest
 					? buildImageRequestContext(req, requestBody, incomingUrl.pathname)
+					: isSearchRequest
+						? buildSearchRequestContext(req, requestBody)
 						: buildResponsesRequestContext(req, requestBody);
 		if (isResponsesRequest) {
 			context.headers.delete("content-encoding");
@@ -1535,7 +1571,9 @@ async function handleRequestInner(
 					? "thread-goal"
 					: isImageRequest
 						? "images"
-						: "responses",
+						: isSearchRequest
+							? "search"
+							: "responses",
 			model: context.model,
 			projectKey,
 			requestId: traceId,
@@ -2710,7 +2748,14 @@ async function handleRequestInner(
 			if (upstream.status === 402 || upstream.status === HTTP_STATUS.FORBIDDEN) {
 				const bodyText = await readErrorBody(upstream, state.streamStallTimeoutMs);
 				const errorCode = extractErrorCodeFromBody(bodyText);
-				if (isWorkspaceDisabledError(upstream.status, errorCode, bodyText)) {
+				// A search refusal can be feature-level (web search turned off for a
+				// workspace) and still match the deactivation wording below. Pass it
+				// through without touching account health; a deactivated account is
+				// still caught by the conversation's next Responses request.
+				if (
+					!isSearchRequest &&
+					isWorkspaceDisabledError(upstream.status, errorCode, bodyText)
+				) {
      if(requestScope && refreshed.account.workspaces?.length) {
       if(accountManager.disableWorkspace(refreshed.account,requestScope.accountId)) accountManager.saveToDiskDebounced();
       pendingScopes?.shift();

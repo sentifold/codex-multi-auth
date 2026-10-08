@@ -20,6 +20,10 @@ describe("usage ledger redaction and normalization", () => {
 		expect(row.operation).toBe("images");
 		expect(row.account?.index).toBe(1);
 	});
+	it("preserves the search operation instead of silently normalizing it to unknown", () => {
+		const row = normalizeUsageLedgerRow({ source: "runtime-proxy", operation: "search", outcome: "success", model: "gpt-5.6-sol", statusCode: 200 });
+		expect(row.operation).toBe("search");
+	});
 	afterEach(() => {
 		vi.useRealTimers();
 	});

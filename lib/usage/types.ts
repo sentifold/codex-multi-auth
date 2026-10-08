@@ -8,6 +8,7 @@ export type UsageLedgerSource =
 export type UsageLedgerOperation =
 	| "responses"
 	| "images"
+	| "search"
 	| "models"
 	| "thread-goal"
 	| "auth-refresh"

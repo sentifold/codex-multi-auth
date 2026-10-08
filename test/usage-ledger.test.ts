@@ -82,6 +82,16 @@ describe("usage ledger core", () => {
 		expect(raw).not.toContain("b64_json");
 	});
 
+	it("round-trips standalone web search accounting", async () => {
+		const { appendUsageLedgerRow, readUsageLedgerRows } = await import("../lib/usage/index.js");
+		const row = await appendUsageLedgerRow({
+			source: "runtime-proxy", operation: "search", outcome: "success",
+			model: "gpt-5.6-sol", statusCode: 200, accountIndex: 0,
+		});
+		expect(row.operation).toBe("search");
+		await expect(readUsageLedgerRows()).resolves.toEqual([row]);
+	});
+
 	it("summarizes usage by model and applies date filters", async () => {
 		const { appendUsageLedgerRow, summarizeUsageLedger } = await import(
 			"../lib/usage/index.js"

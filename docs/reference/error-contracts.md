@@ -138,7 +138,7 @@ stable `error.code` field.
 
 | Code | HTTP status | Meaning |
 | --- | --- | --- |
-| `runtime_rotation_proxy_not_found` | `404` | Path/method outside the supported Responses/model-discovery surface |
+| `runtime_rotation_proxy_not_found` | `404` | Path/method outside the supported Responses, model-discovery, image, standalone web search, and thread-goal surface |
 | `runtime_rotation_proxy_unauthorized` | `401` | Local request missing the per-process proxy client key |
 | `runtime_rotation_proxy_payload_too_large` | `413` | Request body exceeded the proxy safety cap |
 | `codex_runtime_rotation_pool_exhausted` | `429` or `503` | No managed account can currently service the request |

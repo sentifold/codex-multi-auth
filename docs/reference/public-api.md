@@ -158,7 +158,8 @@ Runtime rotation is a CLI/runtime feature, not a library transport API.
   current process without changing settings.
 - The local provider id is `codex-multi-auth-runtime-proxy`.
 - The proxy accepts only authenticated loopback requests for Responses API,
-  model discovery, and thread-goal paths.
+  model discovery, image generation/edit, standalone web search
+  (`/alpha/search`), and thread-goal paths.
 - Account policy `pause`/`drain` (via `codex-multi-auth account ...`) is
   enforced by `evaluateRuntimePolicy` and blocks those accounts from hybrid
   selection.
