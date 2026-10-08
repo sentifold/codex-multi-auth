@@ -10,7 +10,7 @@ import * as zlib from "node:zlib";
 import { AccountManager, getRuntimeTrackerKey } from "../lib/accounts.js";
 import { getModelFamily } from "../lib/prompts/codex.js";
 import { CodexValidationError } from "../lib/errors.js";
-import { HTTP_STATUS, OPENAI_HEADERS } from "../lib/constants.js";
+import { HTTP_STATUS, OPENAI_HEADERS, OPENAI_HEADER_VALUES } from "../lib/constants.js";
 import {
 	startRuntimeRotationProxy,
 	buildTokenInvalidationBody,
@@ -1003,6 +1003,60 @@ describe("runtime rotation proxy", () => {
 		});
 		expect(proxy.getStatus()).not.toHaveProperty("lastAccountEmail");
 		expect(JSON.parse(calls[0]?.bodyText ?? "{}")).toEqual(requestBody);
+	});
+
+	it("preserves the client-stated originator and OpenAI-Beta identity", async () => {
+		const now = Date.now();
+		const accountManager = new AccountManager(undefined, createStorage(now));
+		const { calls, fetchImpl } = createRecordingFetch(() =>
+			textEventStream("data: ok\n\n"),
+		);
+		const proxy = await startProxy({ accountManager, fetchImpl });
+
+		const response = await postResponses(
+			proxy,
+			{
+				model: "gpt-5-codex",
+				stream: true,
+				input: [{ type: "message", role: "user", content: "hi" }],
+			},
+			"/responses",
+			{
+				originator: "codex_vscode",
+				"openai-beta": "responses_websockets=2026-02-06",
+			},
+		);
+
+		expect(response.status).toBe(HTTP_STATUS.OK);
+		expect(calls).toHaveLength(1);
+		expect(calls[0]?.headers.get(OPENAI_HEADERS.ORIGINATOR)).toBe("codex_vscode");
+		expect(calls[0]?.headers.get(OPENAI_HEADERS.BETA)).toBe(
+			"responses_websockets=2026-02-06",
+		);
+	});
+
+	it("fills the default client identity when the client states none", async () => {
+		const now = Date.now();
+		const accountManager = new AccountManager(undefined, createStorage(now));
+		const { calls, fetchImpl } = createRecordingFetch(() =>
+			textEventStream("data: ok\n\n"),
+		);
+		const proxy = await startProxy({ accountManager, fetchImpl });
+
+		const response = await postResponses(proxy, {
+			model: "gpt-5-codex",
+			stream: true,
+			input: [{ type: "message", role: "user", content: "hi" }],
+		});
+
+		expect(response.status).toBe(HTTP_STATUS.OK);
+		expect(calls).toHaveLength(1);
+		expect(calls[0]?.headers.get(OPENAI_HEADERS.ORIGINATOR)).toBe(
+			OPENAI_HEADER_VALUES.ORIGINATOR_CODEX,
+		);
+		expect(calls[0]?.headers.get(OPENAI_HEADERS.BETA)).toBe(
+			OPENAI_HEADER_VALUES.BETA_RESPONSES,
+		);
 	});
 
 	it("routes every request to the ephemeral forced account without rotating (#623)", async () => {

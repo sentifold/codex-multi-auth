@@ -584,8 +584,16 @@ function createOutboundHeaders(
 	headers.delete("x-openai-actor-authorization");
 	headers.set("authorization", `Bearer ${accessToken}`);
 	headers.set(OPENAI_HEADERS.ACCOUNT_ID, accountId);
-	headers.set(OPENAI_HEADERS.BETA, OPENAI_HEADER_VALUES.BETA_RESPONSES);
-	headers.set(OPENAI_HEADERS.ORIGINATOR, OPENAI_HEADER_VALUES.ORIGINATOR_CODEX);
+	// Official Codex clients state their own `originator` (e.g. codex_vscode)
+	// and OpenAI-Beta flags; keep them so upstream sees the client that made
+	// the request. Requests that state none (e.g. the proxy's own catalog
+	// fetch) still get the CLI defaults.
+	if (!headers.has(OPENAI_HEADERS.BETA)) {
+		headers.set(OPENAI_HEADERS.BETA, OPENAI_HEADER_VALUES.BETA_RESPONSES);
+	}
+	if (!headers.has(OPENAI_HEADERS.ORIGINATOR)) {
+		headers.set(OPENAI_HEADERS.ORIGINATOR, OPENAI_HEADER_VALUES.ORIGINATOR_CODEX);
+	}
 	return headers;
 }
 
