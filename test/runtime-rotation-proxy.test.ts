@@ -5055,6 +5055,60 @@ it("routes native WebSocket model requests through capability-aware account prio
  }finally{client?.terminate();for(const ws of wss.clients)ws.terminate();wss.close();await new Promise<void>(r=>upstream.close(()=>r()));}
 });
 
+it("forwards the native client's own identity on the upstream WebSocket handshake", async () => {
+	const upstream = createServer();
+	const wss = new WebSocketServer({ server: upstream });
+	const handshakes: { originator?: string; beta?: string }[] = [];
+	wss.on("connection", (ws, req) => {
+		handshakes.push({
+			originator: req.headers.originator as string | undefined,
+			beta: req.headers["openai-beta"] as string | undefined,
+		});
+		ws.on("message", () => {
+			ws.send(JSON.stringify({ type: "response.completed", response: { id: "fixture-response", output: [] } }));
+		});
+	});
+	upstream.listen(0, "127.0.0.1");
+	await once(upstream, "listening");
+	const address = upstream.address();
+	if (!address || typeof address === "string") throw Error("fixture listen");
+	let client: WebSocket | undefined;
+	try {
+		const accountManager = new AccountManager(undefined, createStorage(Date.now()));
+		const proxy = await startProxy({
+			accountManager,
+			fetchImpl: async () => Response.json({ models: [{ slug: "shared" }] }),
+			options: { nativeOpenai: true, upstreamBaseUrl: `http://127.0.0.1:${address.port}` },
+		});
+		client = new WebSocket(`${proxy.baseUrl.replace("http:", "ws:")}/responses`, {
+			headers: {
+				authorization: `Bearer ${DEFAULT_CLIENT_API_KEY}`,
+				originator: "codex_vscode",
+				"openai-beta": "responses_websockets=2026-02-06",
+			},
+		});
+		await once(client, "open");
+		const completed = new Promise<void>((resolve, reject) => {
+			const timer = setTimeout(() => reject(Error("WebSocket turn timeout")), 3000);
+			client?.on("message", (raw) => {
+				if (JSON.parse(raw.toString()).type === "response.completed") {
+					clearTimeout(timer);
+					resolve();
+				}
+			});
+		});
+		client.send(JSON.stringify({ type: "response.create", model: "shared", input: [{ role: "user", content: "test" }] }));
+		await completed;
+		// Upstream sees exactly what the client would send without the proxy.
+		expect(handshakes).toEqual([{ originator: "codex_vscode", beta: "responses_websockets=2026-02-06" }]);
+	} finally {
+		client?.terminate();
+		for (const ws of wss.clients) ws.terminate();
+		wss.close();
+		await new Promise<void>((resolve) => upstream.close(() => resolve()));
+	}
+});
+
 it("learns a stale subscription model entitlement and retries another eligible account",async()=>{
  const manager=new AccountManager(undefined,createStorage(Date.now()));
  const {calls,fetchImpl}=createRecordingFetch(call=>call.url.includes("/models")?Response.json({models:[{slug:"shared"}]}):call.headers.get("chatgpt-account-id")==="acc_1"?Response.json({error:{code:"model_not_found",param:"model"}},{status:404}):textEventStream('data: {"type":"response.completed","response":{}}\n\n'));

@@ -569,7 +569,7 @@ export class ResponsesWebSocketGateway {
 						for (const [key, value] of Object.entries(req.headers)) {
 							if (
 								typeof value === "string" &&
-								!/^(host|connection|upgrade|sec-websocket-|content-|origin)/i.test(
+								!/^(host|connection|upgrade|sec-websocket-|content-|origin$)/i.test(
 									key,
 								)
 							)
