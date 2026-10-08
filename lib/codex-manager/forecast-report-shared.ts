@@ -1,5 +1,5 @@
 import type { ForecastAccountResult } from "../forecast.js";
-import type { CodexQuotaSnapshot } from "../quota-probe.js";
+import type { CodexQuotaSnapshot, CodexQuotaWindow } from "../quota-probe.js";
 import {
 	findMatchingAccountIndex,
 	type AccountMetadataV3,
@@ -89,6 +89,8 @@ export function serializeForecastResults(
 		planType?: string;
 		activeLimit?: number;
 		model: string;
+		primary: CodexQuotaWindow;
+		secondary: CodexQuotaWindow;
 		summary: string;
 	};
 	refreshFailure?: TokenFailure;
@@ -112,6 +114,8 @@ export function serializeForecastResults(
 						planType: liveQuota.planType,
 						activeLimit: liveQuota.activeLimit,
 						model: liveQuota.model,
+						primary: { ...liveQuota.primary },
+						secondary: { ...liveQuota.secondary },
 						summary: formatQuotaSnapshotLine(liveQuota),
 				  }
 				: undefined,

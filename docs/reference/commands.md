@@ -275,6 +275,11 @@ answers for that model: an account that rejects it is marked `unavailable` with
 the reason `<model> not available for this account` (also listed in
 `probeErrors`) and is never recommended.
 
+With `--live`, each `accounts[].liveQuota` carries the `primary` and
+`secondary` windows (`usedPercent`, `windowMinutes`, `resetAtMs`; a value the
+backend did not send is omitted) next to the formatted `summary`.
+`report --json` forecast rows carry the same fields.
+
 ---
 
 ## `codex-multi-auth workspace`

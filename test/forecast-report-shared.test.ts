@@ -310,9 +310,14 @@ describe("serializeForecastResults", () => {
 				planType: "plus",
 				activeLimit: 100,
 				model: "gpt-5-codex",
+				primary: { usedPercent: 10, windowMinutes: 300, resetAtMs: NOW + 1 },
+				secondary: { usedPercent: 5, windowMinutes: 10_080, resetAtMs: NOW + 2 },
 				summary: "summary:gpt-5-codex",
 			},
 		});
+		// Copies, so a serialized row cannot alias the live snapshot.
+		expect(rows[0].liveQuota?.primary).not.toBe(snapshot.primary);
+		expect(rows[0].liveQuota?.secondary).not.toBe(snapshot.secondary);
 		expect(rows[0].refreshFailure).toBeUndefined();
 		expect(rows[1]).toMatchObject({
 			index: 1,
