@@ -5350,7 +5350,10 @@ describe("OpenAIOAuthPlugin runtime toast forwarding", () => {
 		expect(markRateLimitedWithReason).not.toHaveBeenCalled();
 	});
 
-	it("rotates account when upstream 404 usage_limit_reached is remapped to 429", async () => {
+	it.each([
+		["the ordinary pool", undefined],
+		["a separately metered pool", "codex_other"],
+	] as const)("rotates account when upstream 404 usage_limit_reached is remapped to 429 (%s)", async (_pool, quotaPool) => {
 		const { AccountManager } = await import("../lib/accounts.js");
 		const fetchHelpersModule = await import("../lib/request/fetch-helpers.js");
 		const rateLimitBackoffModule = await import(
@@ -5420,6 +5423,7 @@ describe("OpenAIOAuthPlugin runtime toast forwarding", () => {
 			rateLimit: {
 				retryAfterMs: 2 * 60 * 60 * 1000,
 				code: "usage_limit_reached",
+				...(quotaPool ? { quotaPool } : {}),
 			},
 			errorBody: JSON.stringify({
 				error: { code: "usage_limit_reached", message: "Usage limit reached" },
@@ -5471,6 +5475,7 @@ describe("OpenAIOAuthPlugin runtime toast forwarding", () => {
 			"gpt-5.1",
 			expect.any(String),
 			"gpt-5.1",
+			quotaPool,
 		);
 	});
 
@@ -5988,6 +5993,7 @@ describe("OpenAIOAuthPlugin runtime toast forwarding", () => {
 			"gpt-5.1",
 			expect.any(String),
 			"gpt-5.1",
+			undefined,
 		);
 	});
 
@@ -6098,6 +6104,7 @@ describe("OpenAIOAuthPlugin runtime toast forwarding", () => {
 			"gpt-5.1",
 			expect.any(String),
 			"gpt-5.1",
+			undefined,
 		);
 		expect(recordRateLimit).toHaveBeenCalled();
 	});

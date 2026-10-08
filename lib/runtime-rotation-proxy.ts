@@ -31,6 +31,7 @@ import {
 	AccountManager,
 	AUTH_INVALIDATION_MARKER,
 	extractAccountId,
+	parseSeparateQuotaPool,
 	type ManagedAccount,
 } from "./accounts.js";
 import { withRoutingMutex } from "./routing-mutex.js";
@@ -2696,6 +2697,7 @@ async function handleRequestInner(
 					context.family,
 					"quota",
 					context.model,
+					parseSeparateQuotaPool(upstream.headers),
 				);
 				accountManager.saveToDiskDebounced();
 				exhaustionReason = "rate-limit";

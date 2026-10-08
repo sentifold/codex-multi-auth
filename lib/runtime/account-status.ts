@@ -160,9 +160,10 @@ export function formatRateLimitEntry(
  * earliest-reset-across-every-`family:*`-key answer feeds wait displays and
  * model-less callers:
  *
- * - narrower, because `markRateLimitedWithReason` keys token/concurrency limits
- *   under `family:<model>`, and a sibling model's record does not gate this
- *   request — folding it in reports a delay the runtime proxy would not impose;
+ * - narrower, because `markRateLimitedWithReason` keys token/concurrency limits,
+ *   and usage limits of a separately metered pool, under `family:<model>`, and
+ *   a sibling model's record does not gate this request — folding it in
+ *   reports a delay the runtime proxy would not impose;
  * - later, because the account stays skipped while EITHER key is active, so the
  *   earliest reset understates the wait when both are set.
  *

@@ -3,6 +3,7 @@
  * These functions break down the complex fetch logic into manageable, testable units
  */
 
+import { parseSeparateQuotaPool } from "../accounts/rate-limits.js";
 import { logRequest, logError, logWarn } from "../logger.js";
 import { getCodexInstructions, getModelFamily } from "../prompts/codex.js";
 import {
@@ -68,6 +69,8 @@ export type {
 export interface RateLimitInfo {
         retryAfterMs: number;
         code?: string;
+        /** Separately metered pool the 429 was charged to; absent for the ordinary pool. */
+        quotaPool?: string;
 }
 
 // MAX_RATE_LIMIT_DELAY_MS is centralized in constants.ts (shared with the
@@ -386,8 +389,9 @@ function extractRateLimitInfoFromBody(
 
         const retryAfterMs =
                 parseRetryAfterMs(response, bodyText, parsed) ?? 60000;
+        const quotaPool = parseSeparateQuotaPool(response.headers);
 
-        return { retryAfterMs, code: parsed?.code };
+        return { retryAfterMs, code: parsed?.code, ...(quotaPool ? { quotaPool } : {}) };
 }
 
 interface RateLimitErrorBody {

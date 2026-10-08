@@ -34,7 +34,7 @@ import {
 } from "../lib/storage/path-state.js";
 import type { AccountStorageV3 } from "../lib/storage.js";
 import type { OAuthAuthDetails } from "../lib/types.js";
-import { MODEL_FAMILIES } from "../lib/prompts/codex.js";
+import { getModelFamily, MODEL_FAMILIES } from "../lib/prompts/codex.js";
 
 vi.mock("../lib/storage.js", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("../lib/storage.js")>();
@@ -4148,6 +4148,103 @@ describe("AccountManager", () => {
 
 			expect(account.rateLimitResetTimes.codex).toBeUndefined();
 			expect(account.rateLimitResetTimes["codex:gpt-5.1"]).toBeTypeOf("number");
+		});
+
+		describe("usage limits and prompt-family siblings", () => {
+			const limitedModel = "gpt-6.1-sol";
+			const siblingModel = "gpt-6-astra";
+			const family = getModelFamily(limitedModel);
+
+			function singleAccountManager(): AccountManager {
+				const now = Date.now();
+				return new AccountManager(undefined, {
+					version: 3,
+					activeIndex: 0,
+					accounts: [{ refreshToken: "token-1", addedAt: now, lastUsed: now }],
+				});
+			}
+
+			it("shares one prompt family between the two models", () => {
+				expect(getModelFamily(siblingModel)).toBe(family);
+			});
+
+			it("benches the whole family for a usage limit on the ordinary pool", () => {
+				const manager = singleAccountManager();
+				const account = manager.getCurrentAccount()!;
+
+				manager.markRateLimitedWithReason(
+					account,
+					60 * 60_000,
+					family,
+					"quota",
+					limitedModel,
+				);
+
+				expect(
+					manager.getManagedAccountRuntimeSkipReason(account, family, limitedModel),
+				).toBe("rate-limited");
+				expect(
+					manager.getManagedAccountRuntimeSkipReason(account, family, siblingModel),
+				).toBe("rate-limited");
+			});
+
+			it.each(["quota", "unknown"] as const)(
+				"keeps %s limits charged to a separately metered pool off the siblings, across a reload",
+				async (reason) => {
+					const { saveAccounts } = await import("../lib/storage.js");
+					const mockSaveAccounts = vi.mocked(saveAccounts);
+					const manager = singleAccountManager();
+					const account = manager.getCurrentAccount()!;
+
+					manager.markRateLimitedWithReason(
+						account,
+						60 * 60_000,
+						family,
+						reason,
+						limitedModel,
+						"codex_other",
+					);
+
+					expect(account.rateLimitResetTimes[family]).toBeUndefined();
+					expect(
+						manager.getManagedAccountRuntimeSkipReason(account, family, limitedModel),
+					).toBe("rate-limited");
+					expect(
+						manager.getManagedAccountRuntimeSkipReason(account, family, siblingModel),
+					).toBeNull();
+
+					await manager.saveToDisk();
+					const persisted = mockSaveAccounts.mock.calls.at(-1)?.[0];
+					if (!persisted) throw new Error("expected persisted storage");
+					const reloaded = new AccountManager(undefined, persisted);
+					const restored = reloaded.getCurrentAccount()!;
+					expect(
+						reloaded.getManagedAccountRuntimeSkipReason(restored, family, limitedModel),
+					).toBe("rate-limited");
+					expect(
+						reloaded.getManagedAccountRuntimeSkipReason(restored, family, siblingModel),
+					).toBeNull();
+				},
+			);
+
+			it("keeps a separately metered limit family-wide when no model is known", () => {
+				const manager = singleAccountManager();
+				const account = manager.getCurrentAccount()!;
+
+				manager.markRateLimitedWithReason(
+					account,
+					60_000,
+					family,
+					"quota",
+					undefined,
+					"codex_other",
+				);
+
+				expect(account.rateLimitResetTimes[family]).toBeTypeOf("number");
+				expect(
+					manager.getManagedAccountRuntimeSkipReason(account, family, siblingModel),
+				).toBe("rate-limited");
+			});
 		});
 
 		it("recordFailure updates health tracker", () => {

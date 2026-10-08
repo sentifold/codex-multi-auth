@@ -40,8 +40,9 @@ export interface ForecastAccountInput {
 	family?: ModelFamily;
 	/**
 	 * Normalized model the forecast is about, when the caller has one. Selection
-	 * keys token/concurrency limits under `family:<model>`, so without it a
-	 * sibling model's record would be read as gating this one.
+	 * keys token/concurrency limits, and usage limits of a separately metered
+	 * pool, under `family:<model>`, so without it a sibling model's record would
+	 * be read as gating this one.
 	 */
 	model?: string | null;
 }

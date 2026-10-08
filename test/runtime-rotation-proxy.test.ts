@@ -3017,6 +3017,88 @@ describe("runtime rotation proxy", () => {
 		expect(accountManager.getAccountByIndex(1)?.enabled).toBe(true);
 	});
 
+	describe("usage-limit 429s and prompt-family siblings", () => {
+		const limitedModel = "gpt-6.1-sol";
+		const siblingModel = "gpt-6-astra";
+
+		function usageLimitFetch(poolHeaders: Record<string, string>) {
+			return createRecordingFetch((call) => {
+				const { model } = JSON.parse(call.bodyText) as { model: string };
+				if (model === limitedModel) {
+					return new Response(
+						JSON.stringify({ error: { type: "usage_limit_reached" } }),
+						{
+							status: HTTP_STATUS.TOO_MANY_REQUESTS,
+							headers: {
+								"content-type": "application/json",
+								"retry-after": "86400",
+								...poolHeaders,
+							},
+						},
+					);
+				}
+				return textEventStream("data: sibling-ok\n\n");
+			});
+		}
+
+		const sentModels = (calls: Array<{ bodyText: string }>): string[] =>
+			calls.map((call) => (JSON.parse(call.bodyText) as { model: string }).model);
+
+		it("shares one prompt family between the two models", () => {
+			expect(getModelFamily(siblingModel)).toBe(getModelFamily(limitedModel));
+		});
+
+		it("keeps serving a sibling on the account when the 429 names a separately metered pool", async () => {
+			const accountManager = new AccountManager(undefined, createStorage(Date.now(), 1));
+			const { calls, fetchImpl } = usageLimitFetch({
+				"x-codex-active-limit": "codex_other",
+			});
+			const proxy = await startProxy({ accountManager, fetchImpl });
+
+			const limited = await postResponses(proxy, { model: limitedModel });
+			expect(limited.ok).toBe(false);
+			await limited.text();
+
+			const sibling = await postResponses(proxy, { model: siblingModel });
+			expect(sibling.status).toBe(HTTP_STATUS.OK);
+			expect(await sibling.text()).toContain("sibling-ok");
+
+			const limitedAgain = await postResponses(proxy, { model: limitedModel });
+			expect(limitedAgain.ok).toBe(false);
+			await limitedAgain.text();
+
+			// The limited model is not re-sent while its own pool's window is open.
+			expect(sentModels(calls)).toEqual([limitedModel, siblingModel]);
+			expect(calls.map((call) => call.headers.get(OPENAI_HEADERS.ACCOUNT_ID))).toEqual([
+				"acc_1",
+				"acc_1",
+			]);
+		});
+
+		it.each([
+			["without x-codex-active-limit", {}],
+			["naming the ordinary codex pool", { "x-codex-active-limit": "codex" }],
+		] as const)(
+			"benches the siblings on the account for a 429 %s",
+			async (_label, poolHeaders) => {
+				const accountManager = new AccountManager(undefined, createStorage(Date.now(), 1));
+				const { calls, fetchImpl } = usageLimitFetch(poolHeaders);
+				const proxy = await startProxy({ accountManager, fetchImpl });
+
+				const limited = await postResponses(proxy, { model: limitedModel });
+				expect(limited.ok).toBe(false);
+				await limited.text();
+
+				const sibling = await postResponses(proxy, { model: siblingModel });
+				expect(sibling.status).toBe(HTTP_STATUS.SERVICE_UNAVAILABLE);
+				await sibling.text();
+
+				// The shared ordinary pool is exhausted: the sibling is not sent upstream.
+				expect(sentModels(calls)).toEqual([limitedModel]);
+			},
+		);
+	});
+
 	it("persists cooldowns so a restarted proxy avoids limited accounts", async () => {
 		const now = Date.now();
 		const persisted: AccountStorageV3[] = [];

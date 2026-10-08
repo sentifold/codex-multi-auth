@@ -2,6 +2,7 @@ import { expect, it, vi } from 'vitest';
 import { recoverResetQuota } from '../lib/runtime/reset-credit-routing.js';
 import { AccountManager } from '../lib/accounts.js';
 import { workspaceModelScopes } from '../lib/runtime/workspace-model-scopes.js';
+import { getModelFamily } from '../lib/prompts/codex.js';
 function fixture(){
  const manager=new AccountManager(undefined,{version:3,activeIndex:0,accounts:[{recordId:'first',accountId:'workspace',refreshToken:'r',addedAt:1,lastUsed:1}]});
  // Recovery schedules a debounced save; never let it write the shared test store after the test.
@@ -25,6 +26,21 @@ it('applies a manual redemption once, without erasing a later failure',async()=>
  const apply=()=>applyConfirmedReset({account:f.account,scope:f.scope,model:'chat-test',family:'codex',manager:f.manager,snapshot,lastRedemptionAt:now-1000,previous:f.observations.get(JSON.stringify([f.scope.id,'chat-test'])),observations:f.observations,clearQuotaScheduler:f.clear,now});
  expect(apply()).toBe(true);expect(f.account.rateLimitResetTimes).toEqual({});
  f.account.rateLimitResetTimes={codex:now+90000};expect(apply()).toBe(false);expect(f.account.rateLimitResetTimes.codex).toBe(now+90000);
+});
+
+it.each([
+ ['clears an ordinary-pool usage limit',undefined,null],
+ ['keeps a separately metered usage limit',"codex_other",'rate-limited'],
+] as const)('%s hit on a prompt-family sibling when an ordinary reset is confirmed',async(_label,quotaPool,expected)=>{
+ const {applyConfirmedReset}=await import('../lib/runtime/reset-credit-routing.js');const f=fixture();const now=Date.now();
+ const limited='gpt-6.1-sol';const sibling='gpt-6-astra';const family=getModelFamily(limited);
+ expect(getModelFamily(sibling)).toBe(family);
+ f.manager.markRateLimitedWithReason(f.account,60*60_000,family,'quota',limited,quotaPool);
+ const snapshot={updatedAt:now,ordinaryUsageAllowed:true,availableCount:1,planType:'pro',primary:{usedPercent:0},secondary:{usedPercent:0}};
+ expect(applyConfirmedReset({account:f.account,scope:f.scope,model:sibling,family,manager:f.manager,snapshot,lastRedemptionAt:now-1000,previous:undefined,observations:f.observations,clearQuotaScheduler:f.clear,now})).toBe(true);
+ expect(f.manager.getManagedAccountRuntimeSkipReason(f.account,family,sibling)).toBeNull();
+ // The reset restores ordinary usage; it says nothing about a separately metered pool.
+ expect(f.manager.getManagedAccountRuntimeSkipReason(f.account,family,limited)).toBe(expected);
 });
 
 it('checks capacity in every eligible scope before excluding unsupported redemption targets',async()=>{

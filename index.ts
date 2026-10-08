@@ -2349,6 +2349,7 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 															modelFamily,
 															parseRateLimitReason(rateLimit?.code),
 															model,
+															rateLimit?.quotaPool,
 														);
 														accountManager.recordRateLimit(
 															account,
@@ -2392,6 +2393,7 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 														modelFamily,
 														parseRateLimitReason(rateLimit?.code),
 														model,
+														rateLimit?.quotaPool,
 													);
 													accountManager.recordRateLimit(
 														account,
@@ -2702,6 +2704,7 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 																			modelFamily,
 																			"quota",
 																			model,
+																			fallbackRateLimit?.quotaPool,
 																		);
 																		accountManager.recordRateLimit(
 																			fallbackAccount,

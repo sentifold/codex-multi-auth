@@ -7,6 +7,7 @@ import {
 	isRateLimitedForFamily,
 	isRateLimitedForQuotaKey,
 	parseRateLimitReason,
+	parseSeparateQuotaPool,
 	type RateLimitedEntity,
 } from "../lib/accounts/rate-limits.js";
 
@@ -38,6 +39,29 @@ describe("account rate-limit helpers", () => {
 			["slow_down", "unknown"],
 		] as const)("maps %j to %j", (code, expected) => {
 			expect(parseRateLimitReason(code)).toBe(expected);
+		});
+	});
+
+	describe("parseSeparateQuotaPool", () => {
+		it.each([
+			// No header, or the ordinary pool in any spelling: not a separate pool.
+			[undefined, undefined],
+			["", undefined],
+			["   ", undefined],
+			["codex", undefined],
+			[" Codex ", undefined],
+			// Not a limit id: treated as the ordinary pool, never narrowed.
+			["1", undefined],
+			["codex other", undefined],
+			// A named metered pool, normalized like the official client.
+			["codex_other", "codex_other"],
+			["codex-other", "codex_other"],
+			["CODEX_BENGALFOX", "codex_bengalfox"],
+			["base_model_inference", "base_model_inference"],
+		] as const)("reads x-codex-active-limit %j as %j", (value, expected) => {
+			const headers = new Headers();
+			if (value !== undefined) headers.set("x-codex-active-limit", value);
+			expect(parseSeparateQuotaPool(headers)).toBe(expected);
 		});
 	});
 

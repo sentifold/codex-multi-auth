@@ -68,6 +68,7 @@ export {
 
 export {
 	parseRateLimitReason,
+	parseSeparateQuotaPool,
 	getQuotaKey,
 	clampNonNegativeInt,
 	clearExpiredRateLimits,
@@ -1377,12 +1378,24 @@ export class AccountManager {
 		);
 	}
 
+	/**
+	 * Record a rate limit for `account`.
+	 *
+	 * A usage limit (`quota`) is family-wide: every model of the prompt family
+	 * draws from the ordinary subscription pool. A token/concurrency limit binds
+	 * the requested model only, and an `unknown` one binds both. A limit charged
+	 * to a separately metered pool (`quotaPool`, see `parseSeparateQuotaPool`)
+	 * binds the requested model only, whatever the reason: only that model draws
+	 * from the pool, so its prompt-family siblings stay selectable. Without a
+	 * model every limit is family-wide.
+	 */
 	markRateLimitedWithReason(
 		account: ManagedAccount,
 		retryAfterMs: number,
 		family: ModelFamily,
 		reason: RateLimitReason,
 		model?: string | null,
+		quotaPool?: string,
 	): void {
 		let selectionReadable = false;
 		try {
@@ -1420,8 +1433,9 @@ export class AccountManager {
 				: undefined;
 		const newLimits: RateLimitStateV3 = { ...carried?.limits };
 
+		const separatePool = Boolean(model && quotaPool);
 		const baseKey = getQuotaKey(family);
-		if (!model || reason === "quota" || reason === "unknown") {
+		if (!separatePool && (!model || reason === "quota" || reason === "unknown")) {
 			const currentResetAt = account.rateLimitResetTimes[baseKey] ?? 0;
 			account.rateLimitResetTimes[baseKey] = Math.max(currentResetAt, resetAt);
 			newLimits[baseKey] = Math.max(newLimits[baseKey] ?? 0, resetAt);
@@ -1429,7 +1443,10 @@ export class AccountManager {
 
 		if (
 			model &&
-			(reason === "tokens" || reason === "concurrent" || reason === "unknown")
+			(separatePool ||
+				reason === "tokens" ||
+				reason === "concurrent" ||
+				reason === "unknown")
 		) {
 			const modelKey = getQuotaKey(family, model);
 			const currentResetAt = account.rateLimitResetTimes[modelKey] ?? 0;

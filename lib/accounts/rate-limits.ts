@@ -20,6 +20,31 @@ export function parseRateLimitReason(code: string | undefined): RateLimitReason 
 	return "unknown";
 }
 
+/** Limit id upstream uses for the ordinary subscription pool. */
+const ORDINARY_QUOTA_POOL = "codex";
+
+/**
+ * Name of the separately metered usage pool a 429 was charged to, or
+ * `undefined` when it was charged to the ordinary subscription pool.
+ *
+ * Upstream names the pool behind a usage-limit 429 in `x-codex-active-limit`
+ * (for example `codex_other`). The official Codex client reads that header to
+ * pick the matching `x-<limit>-*` usage snapshot, and treats a missing header
+ * as the ordinary `codex` pool. The value is normalized the same way
+ * (trimmed, lowercased, `-` to `_`). Anything that does not read as a limit
+ * id also counts as the ordinary pool, so an unexpected value keeps the
+ * family-wide record rather than narrowing it.
+ */
+export function parseSeparateQuotaPool(headers: Headers): string | undefined {
+	const limitId = headers
+		.get("x-codex-active-limit")
+		?.trim()
+		.toLowerCase()
+		.replaceAll("-", "_");
+	if (!limitId || limitId === ORDINARY_QUOTA_POOL) return undefined;
+	return /^[a-z][a-z0-9_]*$/.test(limitId) ? limitId : undefined;
+}
+
 export function getQuotaKey(family: ModelFamily, model?: string | null): QuotaKey {
 	if (model) {
 		return `${family}:${model}`;

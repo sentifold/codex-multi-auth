@@ -508,6 +508,20 @@ describe('Fetch Helpers Module', () => {
 			expect(rateLimit?.retryAfterMs).toBeGreaterThan(0);
 		});
 
+		it('reports the separately metered pool a usage-limit 429 names', async () => {
+			const body = JSON.stringify({ error: { type: 'usage_limit_reached' } });
+			const metered = await handleErrorResponse(
+				new Response(body, { status: 429, headers: { 'x-codex-active-limit': 'codex_other' } }),
+			);
+			expect(metered.rateLimit?.quotaPool).toBe('codex_other');
+
+			for (const headers of [{}, { 'x-codex-active-limit': 'codex' }]) {
+				const ordinary = await handleErrorResponse(new Response(body, { status: 429, headers }));
+				expect(ordinary.rateLimit?.retryAfterMs).toBeGreaterThan(0);
+				expect(ordinary.rateLimit?.quotaPool).toBeUndefined();
+			}
+		});
+
 		it('maps entitlement-style 404 errors to 403 when only error.type carries the signal', async () => {
 			const body = {
 				error: {
