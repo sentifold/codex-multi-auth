@@ -2,6 +2,8 @@
 
 The runtime proxy accepts POST `/alpha/search`, plus `/codex/alpha/search`, `/v1/alpha/search` and `/v1/codex/alpha/search`. Codex's standalone `web.run` tool calls this endpoint on the provider base URL. Codex 0.154 and later offers that tool instead of the hosted `web_search` Responses tool for Responses Lite models (the gpt-6.x and gpt-5.6 models in its catalog) and when `features.standalone_web_search` is enabled.
 
+The generated runtime provider declares `supports_standalone_web_search = true`, Codex's provider setting for this tool. See [imagegen-provider-compatibility.md](imagegen-provider-compatibility.md#standalone-web-search-setting).
+
 Search requests use the existing local bearer authentication, runtime policy, managed account selection, OAuth refresh and removal of local credentials. Bodies are forwarded unchanged to `/codex/alpha/search` under the configured upstream base (normally `https://chatgpt.com/backend-api`).
 
 ## Account selection and failures

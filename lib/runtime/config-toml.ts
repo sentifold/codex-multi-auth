@@ -237,6 +237,7 @@ function createRuntimeRotationProviderBlock(
 		"requires_openai_auth = false",
 		'http_headers = { "x-openai-actor-authorization" = "codex-multi-auth-local" }',
 		'wire_api = "responses"',
+		"supports_standalone_web_search = true",
 	];
 	if (clientApiKey.trim().length > 0) {
 		lines.splice(

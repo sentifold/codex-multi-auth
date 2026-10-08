@@ -2834,6 +2834,9 @@ describe("codex bin wrapper", () => {
 		expect(output).toContain(
 			`model_providers.${RUNTIME_ROTATION_PROXY_PROVIDER_ID}.wire_api="responses"`,
 		);
+		expect(output).toContain(
+			`model_providers.${RUNTIME_ROTATION_PROXY_PROVIDER_ID}.supports_standalone_web_search=true`,
+		);
 		expect(output).toContain("disable_response_storage=false");
 		expect(output).toContain(
 			`model_provider="${RUNTIME_ROTATION_PROXY_PROVIDER_ID}"`,

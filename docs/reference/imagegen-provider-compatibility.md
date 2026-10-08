@@ -14,6 +14,18 @@ The provider name remains `codex-multi-auth`, `requires_openai_auth = false`, an
 
 Image route support is a separate prerequisite for successful generation. Client image capability/model-catalog requirements and subscription entitlements also still apply. This is a version-sensitive compatibility shim, not a documented general capability API; replace it if Codex exposes a supported provider capability setting.
 
+## Standalone web search setting
+
+Codex offers its standalone `web.run` tool when the provider is `openai`, sends a non-empty `x-openai-actor-authorization` header, or sets `supports_standalone_web_search`. The marker above already passes that check on current Codex. For web search Codex does have a documented provider setting, so generated runtime provider configuration also declares it and web search no longer depends on the marker:
+
+```toml
+supports_standalone_web_search = true
+```
+
+Both generated TOML and canonical-home CLI overrides receive this line. Codex versions without the setting ignore it. The tool's calls go to `{base_url}/alpha/search`, which the runtime proxy forwards (see [web-search-route.md](web-search-route.md)). `image_gen` has no equivalent setting, so the marker stays. A native app bind (`rotation bind-app --native`) keeps the built-in `openai` provider, which qualifies without either line.
+
+The activation flow below applies unchanged: fresh wrapper-launched sessions get the line automatically, and the packaged app gets it when `codex-multi-auth rotation bind-app` regenerates the provider configuration.
+
 ## Activation, upgrades, and rollback
 
 Fresh wrapper-launched sessions receive the marker automatically in their generated runtime provider configuration. For the packaged desktop app, regenerate the persistent provider configuration with the existing supported command:

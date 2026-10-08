@@ -17,6 +17,12 @@ it("exposes image capability while preserving local bearer and static catalog", 
 	expect(config).toContain('"x-openai-actor-authorization" = "codex-multi-auth-local"');
 });
 
+it("declares standalone web search support on the generated runtime provider", () => {
+	const config = rewriteConfigTomlForRuntimeRotationProvider("", "http://127.0.0.1:9999", "local-test-secret");
+	const providerBlock = config.slice(config.indexOf("[model_providers.codex-multi-auth-runtime-proxy]"));
+	expect(providerBlock).toMatch(/^supports_standalone_web_search = true$/m);
+});
+
 describe("restoreTopLevelModelProvider", () => {
 	it("rewrites the runtime rotation provider line back to the original", () => {
 		const original = 'model_provider = "openai"\n[profiles.default]\nmodel = "gpt-5"\n';
