@@ -2549,6 +2549,57 @@ describe("runtime rotation proxy", () => {
 		).toBeGreaterThan(60 * 60 * 1_000);
 	});
 
+	it("tries an account deferred without a reset header again once the fallback cap has passed", async () => {
+		vi.useFakeTimers({ toFake: ["Date"] });
+		const start = 1_800_000_000_000;
+		vi.setSystemTime(start);
+		// Fail stale-state recovery so a held request ends in the exhaustion
+		// response instead of a reload from disk.
+		const loadSpy = vi
+			.spyOn(AccountManager, "loadFromDisk")
+			.mockRejectedValue(new Error("reload unavailable"));
+		try {
+			const storage = createStorage(start, 1);
+			for (const account of storage.accounts) {
+				account.expiresAt = start + 24 * 60 * 60_000;
+			}
+			const accountManager = new AccountManager(undefined, storage);
+			const { calls, fetchImpl } = createRecordingFetch((_call, attempt) =>
+				textEventStream(`data: attempt-${attempt}\n\n`, {
+					"x-codex-primary-used-percent": attempt === 1 ? "100" : "10",
+				}),
+			);
+			const proxy = await startProxy({
+				accountManager,
+				fetchImpl,
+				options: { now: Date.now },
+			});
+
+			const first = await postResponses(proxy, { model: "gpt-5-codex", stream: true });
+			expect(first.status).toBe(HTTP_STATUS.OK);
+			await first.text();
+
+			// Within the default two-hour fallback the account is still held back.
+			vi.setSystemTime(start + 60 * 60_000);
+			const held = await postResponses(proxy, { model: "gpt-5-codex", stream: true });
+			const heldPayload = (await held.json()) as { error: { retry_after_ms: number } };
+			expect(held.status).toBe(HTTP_STATUS.SERVICE_UNAVAILABLE);
+			expect(heldPayload.error.retry_after_ms).toBe(60 * 60_000);
+			expect(calls).toHaveLength(1);
+
+			// After it, the account is tried again even though no newer quota data
+			// arrived while it was held back.
+			vi.setSystemTime(start + 2 * 60 * 60_000 + 60_000);
+			const retried = await postResponses(proxy, { model: "gpt-5-codex", stream: true });
+			expect(retried.status).toBe(HTTP_STATUS.OK);
+			await retried.text();
+			expect(calls).toHaveLength(2);
+		} finally {
+			loadSpy.mockRestore();
+			vi.useRealTimers();
+		}
+	});
+
 	it("keeps quota snapshots attached to account identity across index changes", () => {
 		const scheduler = new PreemptiveQuotaScheduler();
 		const now = Date.now();

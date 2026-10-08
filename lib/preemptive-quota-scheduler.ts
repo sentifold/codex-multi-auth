@@ -61,6 +61,26 @@ function trustedResetWaitMs(
 }
 
 /**
+ * Remaining fallback wait for a near-exhausted window without a trusted reset.
+ * The cap is counted from the snapshot that reported the window, so the
+ * deferral ends at a fixed time. A deferred account is not selected, so no
+ * newer snapshot replaces this one; a cap counted from `now` would restart on
+ * every selection and never let the account back in.
+ */
+function fallbackWaitMs(
+	snapshot: QuotaSchedulerSnapshot,
+	now: number,
+	maxDeferralMs: number,
+): number {
+	const updatedAt = snapshot.updatedAt;
+	const elapsedMs =
+		typeof updatedAt === "number" && Number.isFinite(updatedAt)
+			? Math.max(0, now - updatedAt)
+			: 0;
+	return Math.max(0, maxDeferralMs - elapsedMs);
+}
+
+/**
  * Clamp a number to the inclusive integer range [min, max] after flooring.
  *
  * @param value - The input number to be floored and clamped
@@ -321,7 +341,9 @@ export class PreemptiveQuotaScheduler {
 			snapshot.secondary.usedPercent >= 100 - this.secondaryRemainingPercentThreshold;
 		const getNearExhaustedWait = (window: QuotaSchedulerWindow): number => {
 			const trustedWait = trustedResetWaitMs(window, snapshot, now);
-			return trustedWait === null ? this.maxDeferralMs : trustedWait;
+			return trustedWait === null
+				? fallbackWaitMs(snapshot, now, this.maxDeferralMs)
+				: trustedWait;
 		};
 		const nearExhaustedWait = Math.max(
 			primaryNearExhausted && snapshot.status !== 429

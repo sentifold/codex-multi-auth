@@ -168,7 +168,7 @@ Used only for host plugin mode through the host runtime config file.
 | `preemptiveQuotaRemainingPercent7d` | number | `5` | `CODEX_AUTH_PREEMPTIVE_QUOTA_7D_REMAINING_PCT` (0–100) |
 | `preemptiveQuotaMaxDeferralMs` | number | `7200000` | `CODEX_AUTH_PREEMPTIVE_QUOTA_MAX_DEFERRAL_MS` (min `1000`) |
 
-`preemptiveQuotaMaxDeferralMs` is the fallback delay when a near-exhausted window has missing, invalid, or stale reset data. A trusted future reset may schedule through the reset time, subject to the scheduler's seven-day safety ceiling.
+`preemptiveQuotaMaxDeferralMs` is the fallback delay when a near-exhausted window has missing, invalid, or stale reset data. The delay is counted from the response that reported the window, so the account is tried again once it has passed, even when no newer quota data arrived in the meantime. A trusted future reset may schedule through the reset time, subject to the scheduler's seven-day safety ceiling; a reset reported more than seven days ago is no longer trusted.
 
 ### Context Budget Guard (experimental)
 

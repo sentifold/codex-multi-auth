@@ -227,16 +227,25 @@ describe("preemptive quota scheduler", () => {
 			updatedAt: now,
 		});
 
-		const decision = scheduler.getDeferral("acc:model", now + 1_000);
-
-		expect(decision).toEqual({
+		expect(scheduler.getDeferral("acc:model", now + 1_000)).toEqual({
 			defer: true,
-			waitMs: maxDeferralMs,
+			waitMs: maxDeferralMs - 1_000,
 			reason: "quota-near-exhaustion",
+		});
+		// The cap is counted from the snapshot, so asking again later reports
+		// less time left instead of the full cap.
+		expect(scheduler.getDeferral("acc:model", now + 20 * 60_000)).toEqual({
+			defer: true,
+			waitMs: maxDeferralMs - 20 * 60_000,
+			reason: "quota-near-exhaustion",
+		});
+		expect(scheduler.getDeferral("acc:model", now + maxDeferralMs)).toEqual({
+			defer: false,
+			waitMs: 0,
 		});
 	});
 
-	it("falls back to the configured cap for stale reset data", () => {
+	it("does not defer on stale reset data once the fallback cap has passed", () => {
 		const maxDeferralMs = 30 * 60_000;
 		const scheduler = new PreemptiveQuotaScheduler({ maxDeferralMs });
 		const now = 1_000_000;
@@ -248,12 +257,34 @@ describe("preemptive quota scheduler", () => {
 			updatedAt: now - sevenDaysMs - 1,
 		});
 
-		const decision = scheduler.getDeferral("acc:model", now + 1_000);
+		// The stale reset is not trusted, and the fallback cap counted from the
+		// snapshot ended long ago.
+		expect(scheduler.getDeferral("acc:model", now + 1_000)).toEqual({
+			defer: false,
+			waitMs: 0,
+		});
+	});
 
-		expect(decision).toEqual({
-			defer: true,
-			waitMs: maxDeferralMs,
-			reason: "quota-near-exhaustion",
+	it("releases a far-future reset once the seven-day trust window has passed", () => {
+		const scheduler = new PreemptiveQuotaScheduler({ maxDeferralMs: 30 * 60_000 });
+		const now = 1_000_000;
+		const sevenDaysMs = 7 * 24 * 60 * 60_000;
+		scheduler.update("acc:model", {
+			status: 200,
+			primary: {},
+			secondary: {
+				usedPercent: 100,
+				resetAtMs: now + 30 * 24 * 60 * 60_000,
+			},
+			updatedAt: now,
+		});
+
+		expect(scheduler.getDeferral("acc:model", now + sevenDaysMs - 1_000).defer).toBe(
+			true,
+		);
+		expect(scheduler.getDeferral("acc:model", now + sevenDaysMs + 1_000)).toEqual({
+			defer: false,
+			waitMs: 0,
 		});
 	});
 
