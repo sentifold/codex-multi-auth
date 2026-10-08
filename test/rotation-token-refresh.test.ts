@@ -351,6 +351,105 @@ describe("ensureFreshAccessToken", () => {
 	});
 });
 
+describe("a credential replaced while its refresh is in flight", () => {
+	// A re-login adopted from storage (syncNativeAccountCredentials) can land
+	// while the old credential's refresh is still running. That refresh's
+	// failure belongs to the replaced credential, not to the re-login.
+	it("leaves a re-login adopted during a failed refresh unmarked and uses it", async () => {
+		const { syncNativeAccountCredentials } = await import(
+			"../lib/runtime/native-account-sync.js"
+		);
+		const accountManager = managerWith(STALE_EXPIRES);
+		const account = refreshParams(accountManager).account;
+		queuedRefreshMock.mockImplementation(async () => {
+			syncNativeAccountCredentials(
+				accountManager,
+				storageWith(FRESH_EXPIRES, {
+					refreshToken: "refresh-relogin",
+					accessToken: "access-relogin",
+				}),
+			);
+			return {
+				type: "failed",
+				reason: "http_error",
+				statusCode: 401,
+				message: "Your authentication token has been invalidated.",
+			};
+		});
+
+		const result = await ensureFreshAccessToken(refreshParams(accountManager));
+
+		expect(queuedRefreshMock).toHaveBeenCalledExactlyOnceWith("refresh-1");
+		expect(result).toMatchObject({ ok: true, accessToken: "access-relogin" });
+		expect(accountManager.getAccountByIndex(0)).toBe(account);
+		expect(accountManager.isAccountAuthInvalidated(account)).toBe(false);
+		expect(account.cooldownReason).toBeUndefined();
+		expect(account.consecutiveAuthFailures ?? 0).toBe(0);
+	});
+
+	it("re-evaluates a replaced credential once and still marks nothing", async () => {
+		const accountManager = managerWith(STALE_EXPIRES);
+		const account = refreshParams(accountManager).account;
+		let generation = 0;
+		queuedRefreshMock.mockImplementation(async () => {
+			// Each refresh races another replacement that is itself due a refresh.
+			generation += 1;
+			account.refreshToken = `refresh-replaced-${generation}`;
+			account.access = `access-replaced-${generation}`;
+			account.expires = STALE_EXPIRES;
+			return { type: "failed", reason: "network_error", message: "fetch failed" };
+		});
+
+		const result = await ensureFreshAccessToken(refreshParams(accountManager));
+
+		expect(result).toEqual({ ok: false, retryable: true });
+		expect(queuedRefreshMock.mock.calls.map(([token]) => token)).toEqual([
+			"refresh-1",
+			"refresh-replaced-1",
+		]);
+		expect(accountManager.isAccountAuthInvalidated(account)).toBe(false);
+		expect(account.cooldownReason).toBeUndefined();
+		expect(account.consecutiveAuthFailures ?? 0).toBe(0);
+	});
+
+	it("judges the replacing credential at the time the failed refresh returned", async () => {
+		vi.useFakeTimers({ toFake: ["Date"], now: NOW });
+		try {
+			const accountManager = managerWith(STALE_EXPIRES);
+			const account = refreshParams(accountManager).account;
+			queuedRefreshMock.mockImplementation(async (token: string) => {
+				if (token === "refresh-relogin") {
+					return {
+						type: "success",
+						access: "access-renewed",
+						refresh: "refresh-renewed",
+						expires: NOW + 7_200_000,
+					};
+				}
+				// The re-login is fresh at the caller's `now`, but the old
+				// credential's refresh returns a minute later, when the re-login
+				// is inside the skew window.
+				account.refreshToken = "refresh-relogin";
+				account.access = "access-relogin";
+				account.expires = NOW + SKEW_MS + 20_000;
+				vi.setSystemTime(NOW + 60_000);
+				return { type: "failed", reason: "network_error", message: "fetch failed" };
+			});
+
+			const result = await ensureFreshAccessToken(refreshParams(accountManager));
+
+			expect(queuedRefreshMock.mock.calls.map(([token]) => token)).toEqual([
+				"refresh-1",
+				"refresh-relogin",
+			]);
+			expect(result).toMatchObject({ ok: true, accessToken: "access-renewed" });
+			expect(account.cooldownReason).toBeUndefined();
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+});
+
 describe("applyMonotonicAuthCooldown", () => {
 	it("extends an absent cooldown but never shortens an existing one", () => {
 		const accountManager = managerWith(FRESH_EXPIRES);

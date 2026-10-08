@@ -74,8 +74,7 @@ async function commitRefreshedAuthOnce(
 	return pending;
 }
 
-/** @internal */
-export async function ensureFreshAccessToken(params: {
+type FreshAccessTokenParams = {
 	accountManager: AccountManager;
 	account: ManagedAccount;
 	family: ModelFamily;
@@ -83,17 +82,51 @@ export async function ensureFreshAccessToken(params: {
 	now: number;
 	tokenRefreshSkewMs: number;
 	tokenInvalidationCooldownMs: number;
-}): Promise<
+};
+
+type FreshAccessTokenResult =
 	| { ok: true; accessToken: string; account: ManagedAccount }
-	| { ok: false; retryable: boolean; invalidated?: boolean }
-> {
+	| { ok: false; retryable: boolean; invalidated?: boolean };
+
+/** A refresh failed after the account's credential was replaced; nothing was marked. */
+const CREDENTIAL_REPLACED = Symbol("credential-replaced");
+
+/** @internal */
+export async function ensureFreshAccessToken(
+	params: FreshAccessTokenParams,
+): Promise<FreshAccessTokenResult> {
+	const startedAt = Date.now();
+	const first = await ensureFreshCurrentCredential(params);
+	if (first !== CREDENTIAL_REPLACED) return first;
+	// A re-login adopted while the refresh ran (syncNativeAccountCredentials
+	// updates the live account in place) replaced the credential it refreshed.
+	// Evaluate the account's current credential instead, once. Judge it at the
+	// time the refresh returned, not at the caller's `now`: refresh-queue and
+	// lease waits can outlast the refresh skew. If that credential is replaced
+	// during its own refresh too, give up for now, still without marking.
+	const second = await ensureFreshCurrentCredential({
+		...params,
+		now: params.now + (Date.now() - startedAt),
+	});
+	return second === CREDENTIAL_REPLACED ? { ok: false, retryable: true } : second;
+}
+
+async function ensureFreshCurrentCredential(
+	params: FreshAccessTokenParams,
+): Promise<FreshAccessTokenResult | typeof CREDENTIAL_REPLACED> {
 	const { accountManager, account, family, model, now, tokenRefreshSkewMs, tokenInvalidationCooldownMs } =
 		params;
 	if (hasUsableAccessToken(account, now, tokenRefreshSkewMs)) {
 		return { ok: true, accessToken: account.access ?? "", account };
 	}
 
-	const refreshResult = await queuedRefresh(account.refreshToken);
+	const refreshedToken = account.refreshToken;
+	const refreshResult = await queuedRefresh(refreshedToken);
+	// The failure belongs to the credential that was refreshed. If the account
+	// holds a different one by now, charging it would mark the replacement.
+	if (refreshResult.type === "failed" && account.refreshToken !== refreshedToken) {
+		return CREDENTIAL_REPLACED;
+	}
 	if (refreshResult.type === "failed") {
 		accountManager.recordFailure(account, family, model);
 		accountManager.incrementAuthFailures(account);

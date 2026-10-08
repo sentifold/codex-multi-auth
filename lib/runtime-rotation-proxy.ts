@@ -2361,8 +2361,10 @@ async function handleRequestInner(
 			});
 			if (!refreshed.ok) {
 				refundConsumedPoolToken(selected);
-				// No accountSkipReasons write here: ensureFreshAccessToken always
-				// applies an auth cooldown before returning !ok, so the next
+				// No accountSkipReasons write here: ensureFreshAccessToken
+				// applies an auth cooldown before returning !ok (except when the
+				// credential was replaced during its refresh, which leaves the
+				// account selectable and is retryable), so the next
 				// selection pass overwrites whatever this set with
 				// cooling-down:auth-failure, the invalidated exit returns a 401
 				// without reading the map at all, and the budget-boundary block

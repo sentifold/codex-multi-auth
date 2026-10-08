@@ -4472,6 +4472,102 @@ describe("native re-login while router is running", () => {
 		const rejected = await fetch(`${proxy.baseUrl}/models`, { headers: { authorization: "Bearer new-login-token" } });
 		expect(rejected.status).toBe(401); await rejected.text();
 	});
+
+	it("does not charge the replaced credential's late refresh failure to the re-login during a catalog load", async () => {
+		const storage = createStorage(Date.now(), 1);
+		let disk = structuredClone(storage);
+		withAccountStorageTransactionMock.mockImplementation(async (handler) =>
+			handler(structuredClone(disk), async (next: AccountStorageV3) => { disk = structuredClone(next); }));
+		const accountManager = new AccountManager(undefined, storage);
+		const account = accountManager.getAccountByIndex(0)!;
+		let refreshStarted!: () => void, failRefresh!: () => void;
+		const started = new Promise<void>(resolve => { refreshStarted = resolve; });
+		const gate = new Promise<void>(resolve => { failRefresh = resolve; });
+		refreshAccessTokenMock.mockImplementation(async () => {
+			refreshStarted(); await gate;
+			return { type: "failed", reason: "http_error", statusCode: 401, message: "Your authentication token has been invalidated. Please try signing in again." };
+		});
+		const { calls, fetchImpl } = createRecordingFetch(call => call.url.includes("/models") ? Response.json({ models: [{ slug: "model-a" }] }) : textEventStream());
+		const proxy = await startProxy({ accountManager, fetchImpl, options: { nativeOpenai: true, readNativeAccountStorage: async () => structuredClone(disk) } });
+
+		// The stored access token expires, so the first request's model-catalog load
+		// refreshes the old credential.
+		disk.accounts[0]!.expiresAt = Date.now() - 1;
+		const stale = postResponses(proxy, { model: "model-a", input: "hello" });
+		await started;
+		// The user logs in again while that refresh is in flight; a concurrent request adopts it.
+		Object.assign(disk.accounts[0]!, { accessToken: "relogin-access", refreshToken: "relogin-refresh", expiresAt: Date.now() + 7_200_000 });
+		const concurrent = await postResponses(proxy, { model: "model-a", input: "hello" });
+		expect(concurrent.status).toBe(200); await concurrent.text();
+		expect(account.refreshToken).toBe("relogin-refresh");
+
+		// Only now does the old credential's refresh come back invalidated.
+		failRefresh();
+		const late = await stale;
+		expect(late.status).toBe(200); await late.text();
+		await accountManager.flushPendingSave();
+		expect(refreshAccessTokenMock).toHaveBeenCalledTimes(1);
+		expect(refreshAccessTokenMock.mock.calls[0]?.[0]).toBe("refresh-1");
+		expect(account.authInvalidatedAt).toBeUndefined();
+		expect(account.cooldownReason).toBeUndefined();
+		expect(disk.accounts[0]?.refreshToken).toBe("relogin-refresh");
+		expect(disk.accounts[0]?.authInvalidatedAt).toBeUndefined();
+
+		const next = await postResponses(proxy, { model: "model-a", input: "hello" });
+		expect(next.status).toBe(200); await next.text();
+		expect(calls.filter(c => c.url.endsWith("/responses")).map(c => c.headers.get("authorization"))).toEqual(["Bearer relogin-access", "Bearer relogin-access", "Bearer relogin-access"]);
+	});
+
+	it("does not charge the replaced credential's late refresh failure to the re-login during a request", async () => {
+		let now = Date.now();
+		const storage = createStorage(now, 1);
+		storage.accounts[0]!.expiresAt = now + 180_000;
+		let disk = structuredClone(storage);
+		withAccountStorageTransactionMock.mockImplementation(async (handler) =>
+			handler(structuredClone(disk), async (next: AccountStorageV3) => { disk = structuredClone(next); }));
+		const accountManager = new AccountManager(undefined, storage);
+		const account = accountManager.getAccountByIndex(0)!;
+		let refreshStarted!: () => void, failRefresh!: () => void;
+		const started = new Promise<void>(resolve => { refreshStarted = resolve; });
+		const gate = new Promise<void>(resolve => { failRefresh = resolve; });
+		refreshAccessTokenMock.mockImplementation(async () => {
+			refreshStarted(); await gate;
+			return { type: "failed", reason: "http_error", statusCode: 401, message: "Your authentication token has been invalidated. Please try signing in again." };
+		});
+		const { calls, fetchImpl } = createRecordingFetch(call => call.url.includes("/models") ? Response.json({ models: [{ slug: "model-a" }] }) : textEventStream());
+		const proxy = await startProxy({ accountManager, fetchImpl, options: { nativeOpenai: true, now: () => now, readNativeAccountStorage: async () => structuredClone(disk) } });
+		const warm = await postResponses(proxy, { model: "model-a", input: "hello" });
+		expect(warm.status).toBe(200); await warm.text();
+
+		// The model catalog is still cached, but the access token is now inside the
+		// refresh skew, so the request loop itself refreshes the old credential.
+		now += 150_000;
+		const stale = postResponses(proxy, { model: "model-a", input: "hello" });
+		await started;
+		// The user logs in again while that refresh is in flight; a concurrent request adopts it.
+		Object.assign(disk.accounts[0]!, { accessToken: "relogin-access", refreshToken: "relogin-refresh", expiresAt: now + 7_200_000 });
+		const concurrent = await postResponses(proxy, { model: "model-a", input: "hello" });
+		expect(concurrent.status).toBe(200); await concurrent.text();
+		expect(account.refreshToken).toBe("relogin-refresh");
+
+		// Only now does the old credential's refresh come back invalidated.
+		failRefresh();
+		const late = await stale;
+		expect(late.status).toBe(200); await late.text();
+		await accountManager.flushPendingSave();
+		expect(refreshAccessTokenMock).toHaveBeenCalledTimes(1);
+		expect(refreshAccessTokenMock.mock.calls[0]?.[0]).toBe("refresh-1");
+		expect(account.authInvalidatedAt).toBeUndefined();
+		expect(account.cooldownReason).toBeUndefined();
+		expect(disk.accounts[0]?.refreshToken).toBe("relogin-refresh");
+		expect(disk.accounts[0]?.authInvalidatedAt).toBeUndefined();
+
+		const next = await postResponses(proxy, { model: "model-a", input: "hello" });
+		expect(next.status).toBe(200); await next.text();
+		// One catalog load before the refresh; the adopted re-login drops the cache.
+		expect(calls.filter(c => c.url.includes("/models")).map(c => c.headers.get("authorization"))).toEqual(["Bearer access-1", "Bearer relogin-access"]);
+		expect(calls.filter(c => c.url.endsWith("/responses")).map(c => c.headers.get("authorization"))).toEqual(["Bearer access-1", "Bearer relogin-access", "Bearer relogin-access", "Bearer relogin-access"]);
+	});
 });
 
 describe("native catalog client version", () => {
